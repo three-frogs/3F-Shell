@@ -1,0 +1,4054 @@
+//! Sky Remote Assistance —— Windows 下对 Linux 的远程 SSH 登录与文件系统可视化操作。
+//!
+//! 桌面 GUI（eframe/egui）：
+//! - 上半部分：真实 SSH 交互式终端（VT100 模拟，支持 vim / top 等全屏程序）
+//! - 下半部分：远程文件管理器（浏览 / 上传 / 下载 / 新建 / 删除 / 重命名）
+
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+
+mod kbhook;
+mod ssh;
+
+use std::path::PathBuf;
+use std::sync::mpsc::{self, Receiver, Sender};
+
+use eframe::egui;
+use egui::text::LayoutJob;
+use egui::{
+    Align2, Color32, Event, FontId, Key, Modifiers, Rect, RichText, Sense, Stroke, StrokeKind,
+    TextFormat,
+};
+use egui_extras::{Column, TableBuilder};
+use vt100::Parser as VtParser;
+
+// =====================================================================
+// 后台桥接消息（GUI 线程 <-> 后台 tokio 线程）
+// =====================================================================
+
+/// 连接请求（token 用于把后端生成的会话 id 匹配回发起它的标签页）。
+struct ConnectReq {
+    token: u64,
+    host: String,
+    port: u16,
+    user: String,
+    password: Option<String>,
+    key_path: Option<String>,
+}
+
+enum FsMsg {
+    Connect(ConnectReq),
+    For { id: String, msg: FsInner },
+}
+
+enum FsInner {
+    Disconnect,
+    List(String),
+    Mkdir(String),
+    Remove(String),
+    Rename(String, String),
+    Upload { local: PathBuf, remote_dir: String },
+    Download { remote: String, local: PathBuf },
+    /// 取消当前正在进行的传输（按方向，全局）
+    CancelTransfer { up: bool },
+    ShellInput(Vec<u8>),
+    /// 向远程发送中断：0x03 + SSH SIGINT（docker logs -f 等场景确保可中断）
+    SigInt,
+    SysInfo,
+    Ping,
+}
+
+enum BackMsg {
+    Connected(Result<(u64, String), (u64, String)>), // Ok(token, id) / Err(token, msg)
+    For { id: String, msg: BackInner },
+    Log(String),
+    Progress { up: bool, done: u64, total: u64 }, // 传输实时进度（已传 / 总字节）
+    /// 后台传输开始（用于 UI 展示对应方向的「取消」按钮）
+    TransferStart { up: bool },
+}
+
+enum BackInner {
+    Disconnected,
+    List(Result<Vec<ssh::FileEntry>, String>),
+    Mkdir(Result<(), String>),
+    Remove(Result<(), String>),
+    Rename(Result<(), String>),
+    Upload(Result<u64, String>),
+    Download(Result<u64, String>),
+    ShellData(Vec<u8>),
+    ShellClosed,
+    SysInfo(Result<Vec<(String, String)>, String>),
+    Ping(Result<(), String>),
+}
+
+// =====================================================================
+// 终端状态（VT100 解析器 + 尺寸）
+// =====================================================================
+
+struct TermState {
+    parser: VtParser,
+    dims: (u16, u16),
+    /// 用户当前输入行的字节累积（用于检测 `cd` 命令联动文件面板）
+    pending_line: Vec<u8>,
+    /// 终端当前工作目录（由提示符解析 / cd 命令乐观更新）
+    term_cwd: Option<String>,
+    /// 上次识别到的提示符文本（防止重复触发）
+    last_prompt: Option<String>,
+    /// 回看历史时的滚动偏移（0 = 最新，>0 = 向上回看行数）
+    scroll_offset: usize,
+    /// 鼠标选择：锚点与当前点 ((row,col),(row,col))；None = 无选择
+    sel: Option<((u16, u16), (u16, u16))>,
+}
+
+impl TermState {
+    fn new(rows: u16, cols: u16) -> Self {
+        Self {
+            parser: VtParser::new(rows, cols, 2000), // 2000 行历史缓冲，支持回看
+            dims: (cols, rows),
+            pending_line: Vec::new(),
+            term_cwd: None,
+            last_prompt: None,
+            scroll_offset: 0,
+            sel: None,
+        }
+    }
+
+    /// 把发给远端的输入字节喂给累积器；若检测到 `cd` 命令，
+    /// 返回（乐观计算的）目标绝对路径供文件面板联动。
+    fn feed_input(&mut self, bytes: &[u8], user: &str) -> Option<String> {
+        let mut nav = None;
+        for &b in bytes {
+            match b {
+                0x0d | 0x0a => {
+                    let line = String::from_utf8_lossy(&self.pending_line).into_owned();
+                    self.pending_line.clear();
+                    if let Some(t) = parse_cd_line(&line, &self.term_cwd, user) {
+                        nav = Some(t);
+                    }
+                }
+                0x08 | 0x7f => {
+                    self.pending_line.pop();
+                }
+                // ESC 序列（方向键编辑）、Ctrl+C/D/U/W：无法可靠重建行，放弃追踪
+                0x1b | 0x03 | 0x04 | 0x15 | 0x17 => {
+                    self.pending_line.clear();
+                }
+                0x20..=0x7e | 0x80..=0xff => self.pending_line.push(b),
+                _ => {}
+            }
+        }
+        nav
+    }
+
+    /// 解析终端屏幕最后一行是否为 shell 提示符；若是且与上次不同，
+    /// 返回提示符中的路径（供文件面板定位；权威值，可纠正乐观估计）。
+    /// `line` 为调用方提取的屏幕最后一行文本。
+    fn detect_prompt(&mut self, line: &str) -> Option<String> {
+        let trimmed = line.trim_end().to_string();
+        if let Some(path) = parse_prompt_path(&trimmed) {
+            let changed = self.last_prompt.as_deref() != Some(trimmed.as_str());
+            self.last_prompt = Some(trimmed);
+            if changed {
+                return Some(path);
+            }
+        }
+        None
+    }
+
+    /// 把远端输出字节喂给终端解析器。
+    fn feed(&mut self, data: &[u8]) {
+        self.parser.process(data);
+    }
+}
+
+// =====================================================================
+// 终端 <-> 文件面板联动：cd 命令解析 / 提示符解析 / 路径规范化
+// =====================================================================
+
+/// 登录用户的主目录（启发式：root -> /root，其他 -> /home/<user>）。
+fn home_path(user: &str) -> String {
+    if user.is_empty() || user == "root" {
+        "/root".into()
+    } else {
+        format!("/home/{}", user)
+    }
+}
+
+/// 把 `~` / `~user` 展开为绝对路径，其余原样返回。
+fn expand_tilde(path: &str, user: &str) -> String {
+    if path == "~" {
+        return home_path(user);
+    }
+    if let Some(rest) = path.strip_prefix("~/") {
+        return format!("{}/{}", home_path(user), rest);
+    }
+    if let Some(rest) = path.strip_prefix('~') {
+        // ~otheruser/xxx
+        let rest = rest.trim_start_matches('/');
+        return format!("/home/{}", rest);
+    }
+    path.to_string()
+}
+
+/// 按显示宽度截断单行文本（CJK≈2、其余≈1 个半角单位），超出以 … 结尾。
+fn truncate_wide(s: &str, max_w: usize) -> String {
+    let mut w = 0usize;
+    let mut out = String::new();
+    for ch in s.chars() {
+        let cw = if (ch as u32) > 0x2E80 { 2 } else { 1 };
+        if w + cw > max_w {
+            out.push('…');
+            return out;
+        }
+        w += cw;
+        out.push(ch);
+    }
+    out
+}
+
+/// 把 target（绝对或相对路径）基于 base 规范化：
+/// 处理 `.`、`..`、重复 `/`、结尾 `/`；target 支持 `~` 展开。
+fn normalize_path(base: &str, target: &str, user: &str) -> String {
+    let t = expand_tilde(target, user);
+    let full = if t.starts_with('/') {
+        t
+    } else {
+        format!("{}/{}", base.trim_end_matches('/'), t)
+    };
+    let mut segs: Vec<&str> = Vec::new();
+    for part in full.split('/') {
+        match part {
+            "" | "." => {}
+            ".." => {
+                segs.pop();
+            }
+            p => segs.push(p),
+        }
+    }
+    let mut out = String::from("/");
+    out.push_str(&segs.join("/"));
+    out
+}
+
+/// 解析一行输入是否为 `cd` 命令，返回目标绝对路径。
+/// base 为终端当前目录（None 时按 "/" 处理）。
+fn parse_cd_line(line: &str, term_cwd: &Option<String>, user: &str) -> Option<String> {
+    let line = line.trim();
+    if line.is_empty() {
+        return None;
+    }
+    // 只取第一个命令（忽略 && / ; / | 之后的内容）
+    let cmd = line.split([';', '|', '&']).next()?.trim();
+    let mut parts = cmd.split_whitespace();
+    let first = parts.next()?;
+    if first != "cd" {
+        return None;
+    }
+    let target = parts.next().unwrap_or("~");
+    if target == "-" {
+        return None; // OLDPWD 未知
+    }
+    let base = term_cwd.clone().unwrap_or_else(|| "/".into());
+    Some(normalize_path(&base, target, user))
+}
+
+/// 尝试把一行文本解析为 shell 提示符中的路径。
+/// 支持 `user@host:/path$`、`/path#`、`~$` 等常见格式；解析不出返回 None。
+fn parse_prompt_path(line: &str) -> Option<String> {
+    let line = line.trim_end();
+    if line.is_empty() {
+        return None;
+    }
+    let last = line.chars().last()?;
+    if !matches!(last, '$' | '#' | '%' | '>') {
+        return None;
+    }
+    let body = line[..line.len() - last.len_utf8()].trim_end();
+    let path = if let Some(at) = body.rfind('@') {
+        let after = &body[at + 1..];
+        let ci = after.rfind(':')?;
+        let host = after[..ci].trim();
+        let p = after[ci + 1..].trim();
+        // zsh 的 "user@host /path %" 形式 host 部分含空格，拒绝
+        if host.is_empty() || host.chars().any(|c| c.is_whitespace()) {
+            return None;
+        }
+        if p.is_empty() || p.chars().any(|c| c.is_whitespace()) {
+            return None;
+        }
+        p
+    } else {
+        body.trim()
+    };
+    if path.is_empty() || !(path.starts_with('/') || path.starts_with('~')) {
+        return None;
+    }
+    if path.chars().any(|c| c.is_whitespace()) {
+        return None;
+    }
+    Some(path.to_string())
+}
+
+// =====================================================================
+// 对话框
+// =====================================================================
+
+#[derive(Clone, Copy, PartialEq)]
+enum DialogKind {
+    Mkdir,
+    Rename,
+    ConfirmDelete,
+    NewAccount,
+}
+
+// =====================================================================
+// 连接标签页（每个打开的远端连接一套独立状态）
+// =====================================================================
+
+struct ConnTab {
+    id: String,              // 后端会话 id（连接成功后填充）
+    token: u64,              // 前端发起连接时的匹配 token
+    account: SavedAccount,   // 连接参数（名称/IP/端口 + 密码，用于展示与自动重连）
+    connecting: bool,
+    connected: bool,
+    shell_alive: bool,
+    status: String,
+    login_log: Vec<String>,  // 登录过程日志（未连接时显示在终端区域）
+    term: Option<TermState>,
+    cwd: String,
+    entries: Vec<ssh::FileEntry>,
+    selected: Option<String>,
+    last_ok_cwd: Option<String>,
+    sysinfo: Vec<(String, String)>,
+    manual_disconnect: bool,
+    reconnect_attempts: u32,
+    ping_timer: f64,
+    sysinfo_timer: f64,
+    /// 用户是否手动在文件面板打开过路径（此后停止终端路径自动联动）
+    user_navigated: bool,
+    /// 定时把终端 cwd 同步到文件面板的计时器
+    sync_timer: f64,
+    /// Tab 补全等待目录列表：待补全的词
+    pending_tab_word: Option<String>,
+    /// Tab 补全等待目录列表：发起请求时的终端目录
+    pending_tab_dir: Option<String>,
+    /// 需要把键盘焦点交给终端（连接成功 / 切换标签后置位，渲染时消费）
+    focus_term: bool,
+}
+
+impl ConnTab {
+    fn new(acc: SavedAccount, token: u64) -> Self {
+        Self {
+            id: String::new(),
+            token,
+            account: acc,
+            connecting: false,
+            connected: false,
+            shell_alive: false,
+            status: "未连接".to_string(),
+            login_log: Vec::new(),
+            term: None,
+            cwd: "/".to_string(),
+            entries: Vec::new(),
+            selected: None,
+            last_ok_cwd: None,
+            sysinfo: Vec::new(),
+            manual_disconnect: false,
+            reconnect_attempts: 0,
+            ping_timer: 0.0,
+            sysinfo_timer: 0.0,
+            user_navigated: false,
+            sync_timer: 0.0,
+            pending_tab_word: None,
+            pending_tab_dir: None,
+            focus_term: false,
+        }
+    }
+}
+
+// =====================================================================
+// 应用
+// =====================================================================
+
+struct SshApp {
+    // 连接表单（新增账号 / 发起连接参数）
+    host: String,
+    port: String,
+    user: String,
+    password: String,
+    key_path: Option<PathBuf>,
+    remember_pwd: bool,
+    // 已存账号
+    accounts: Vec<SavedAccount>,
+    // 打开的连接标签页
+    sessions: Vec<ConnTab>,
+    active: usize,
+    next_token: u64,
+    // 后台通道
+    tx: Sender<FsMsg>,
+    rx: Receiver<BackMsg>,
+    // 对话框
+    dialog: Option<DialogKind>,
+    /// 上一帧窗口是否拥有焦点（用于热键注册/注销的状态管理）
+    last_focused: bool,
+    dialog_input: String,
+    dialog_old: String,
+    // 传输明细记录（上传 / 下载）
+    transfer_log: Vec<TransferRec>,
+    show_transfer: bool,
+    /// 后台当前正在执行的传输方向（Some(up) = 正在传输，None = 空闲）；用于显示「取消」按钮
+    active_transfer: Option<bool>,
+    /// 文件操作区域是否显示（可关闭/打开）
+    show_files: bool,
+    /// 文件面板固定高度（首次按窗口一半计算，之后保持不变，防止高度漂移动画）
+    files_h: Option<f32>,
+}
+
+/// 一条传输明细记录。
+struct TransferRec {
+    time: String,       // 发起时间 HH:MM:SS
+    up: bool,           // true=上传 false=下载
+    name: String,       // 文件名 / 目录名
+    size: Option<u64>,  // 完成时的传输字节数
+    ok: bool,
+    detail: String,     // 完成 / 失败原因
+    progress: Option<(u64, u64)>, // 进行中：已传字节 / 总字节（实时进度条）
+    is_dir: bool,       // true=目录（图标区分显示）
+}
+
+/// 更新最近一条未完成传输的结果；找不到则兜底追加一条。
+fn finish_transfer(log: &mut Vec<TransferRec>, up: bool, size: Option<u64>, ok: bool, detail: String) {
+    let mut found = false;
+    for r in log.iter_mut().rev() {
+        if r.up == up && !r.ok && r.detail == "进行中..." {
+            r.size = size;
+            r.ok = ok;
+            r.detail = detail.clone();
+            r.progress = None;
+            found = true;
+            break;
+        }
+    }
+    if !found {
+        log.push(TransferRec {
+            time: now_hms(),
+            up,
+            name: detail.clone(),
+            size,
+            ok,
+            detail: if ok { "完成".to_string() } else { detail },
+            progress: None,
+            is_dir: false,
+        });
+    }
+    persist_transfers(log);
+}
+
+// =====================================================================
+// 传输明细持久化：exe 同目录 transfers.log（TSV：time\tup\tname\tsize\tok\tdetail）
+// =====================================================================
+
+fn transfers_path() -> std::path::PathBuf {
+    std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(|d| d.join("transfers.log")))
+        .unwrap_or_else(|| std::path::PathBuf::from("transfers.log"))
+}
+
+/// TSV 字段净化：字段内的制表符 / 换行替换为空格，保证单行可解析。
+fn sanitize_tsv(s: &str) -> String {
+    s.replace('\t', " ").replace('\n', " ").replace('\r', " ")
+}
+
+/// 启动时加载历史传输记录；中断的（进行中）记录不保留。
+fn load_transfers() -> Vec<TransferRec> {
+    load_transfers_from(&transfers_path())
+}
+
+fn load_transfers_from(path: &std::path::Path) -> Vec<TransferRec> {
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for line in text.lines() {
+        let parts: Vec<&str> = line.split('\t').collect();
+        if parts.len() < 6 {
+            continue;
+        }
+        let ok = parts[4] == "1";
+        if !ok {
+            continue; // 进程退出即中断，进行中记录无意义
+        }
+        out.push(TransferRec {
+            time: parts[0].to_string(),
+            up: parts[1] == "1",
+            name: parts[2].to_string(),
+            size: parts[3].parse::<u64>().ok(),
+            ok,
+            detail: parts[5].to_string(),
+            progress: None,
+            is_dir: parts.get(6).map(|v| *v == "1").unwrap_or(false),
+        });
+    }
+    out
+}
+
+/// 全量写入传输明细（记录量小，直接整体覆盖）。
+fn persist_transfers(log: &[TransferRec]) {
+    persist_transfers_to(&transfers_path(), log);
+}
+
+fn persist_transfers_to(path: &std::path::Path, log: &[TransferRec]) {
+    let mut s = String::new();
+    for r in log {
+        s.push_str(&format!(
+            "{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
+            sanitize_tsv(&r.time),
+            if r.up { 1 } else { 0 },
+            sanitize_tsv(&r.name),
+            r.size.map(|n| n.to_string()).unwrap_or_default(),
+            if r.ok { 1 } else { 0 },
+            sanitize_tsv(&r.detail),
+            if r.is_dir { 1 } else { 0 },
+        ));
+    }
+    let _ = std::fs::write(path, s);
+}
+
+impl SshApp {
+    fn new(cc: &eframe::CreationContext<'_>) -> Self {
+        // egui 默认字体不含 CJK，加载系统中文字体作为回退，避免中文显示为方块；
+        // 同时从 exe 同目录加载 emoji 图标字体（内置 emoji-icon-font 副本，带纵向微调），
+        // 保证 ⚙ 等按钮图标正常显示且位置居中（egui 无法渲染彩色位图 emoji 字体）。
+        for path in ["C:\\Windows\\Fonts\\simhei.ttf", "C:\\Windows\\Fonts\\msyh.ttc"] {
+            if let Ok(bytes) = std::fs::read(path) {
+                let mut fonts = egui::FontDefinitions::default();
+                fonts.font_data.insert(
+                    "cjk".to_owned(),
+                    std::sync::Arc::new(egui::FontData::from_owned(bytes)),
+                );
+                // 用带 tweak 的图标字体副本替换默认 emoji-icon-font（⚙ 等字形下移居中）
+                if let Ok(exe) = std::env::current_exe() {
+                    if let Some(dir) = exe.parent() {
+                        let p = dir.join("emoji-icon-font.ttf");
+                        if let Ok(icon_bytes) = std::fs::read(&p) {
+                            let mut icon_data = egui::FontData::from_owned(icon_bytes);
+                            icon_data.tweak.y_offset = 2.0; // 图标整体下移一点
+                            fonts.font_data.insert(
+                                "icon_font".to_owned(),
+                                std::sync::Arc::new(icon_data),
+                            );
+                            for family in
+                                [egui::FontFamily::Proportional, egui::FontFamily::Monospace]
+                            {
+                                if let Some(list) = fonts.families.get_mut(&family) {
+                                    list.retain(|n| n != "emoji-icon-font");
+                                    list.push("cjk".to_owned());
+                                    list.push("icon_font".to_owned());
+                                }
+                            }
+                            cc.egui_ctx.set_fonts(fonts);
+                            break;
+                        }
+                    }
+                }
+                for family in [egui::FontFamily::Proportional, egui::FontFamily::Monospace] {
+                    if let Some(list) = fonts.families.get_mut(&family) {
+                        list.push("cjk".to_owned());
+                    }
+                }
+                cc.egui_ctx.set_fonts(fonts);
+                break;
+            }
+        }
+
+        // 全局紧凑样式：缩小间距与控件留白，让终端/文件区域更紧凑
+        let mut style = (*cc.egui_ctx.style()).clone();
+        style.spacing.item_spacing = egui::vec2(5.0, 2.0);
+        style.spacing.button_padding = egui::vec2(5.0, 1.0);
+        style.spacing.interact_size.y = 20.0;
+        cc.egui_ctx.set_style(style);
+
+        // 全局深色主题：黑底白字（左侧栏/终端/文件面板/弹窗统一）
+        let mut visuals = egui::Visuals::dark();
+        visuals.panel_fill = Color32::from_rgb(16, 16, 18); // 面板近黑
+        visuals.window_fill = Color32::from_rgb(24, 24, 28); // 弹窗深灰
+        visuals.override_text_color = Some(Color32::WHITE); // 所有文本默认白色（weak 文本也提亮）
+        visuals.widgets.noninteractive.fg_stroke = egui::Stroke::new(1.0_f32, Color32::from_gray(210));
+        visuals.widgets.inactive.fg_stroke = egui::Stroke::new(1.0_f32, Color32::from_gray(210));
+        visuals.widgets.hovered.fg_stroke = egui::Stroke::new(1.0_f32, Color32::WHITE);
+        visuals.widgets.active.fg_stroke = egui::Stroke::new(1.0_f32, Color32::WHITE);
+        visuals.widgets.noninteractive.bg_fill = Color32::from_rgb(30, 30, 34);
+        visuals.widgets.inactive.bg_fill = Color32::from_rgb(38, 38, 44);
+        visuals.widgets.hovered.bg_fill = Color32::from_rgb(52, 52, 60);
+        visuals.widgets.active.bg_fill = Color32::from_rgb(60, 60, 70);
+        visuals.selection.bg_fill = Color32::from_rgb(56, 96, 168);
+        visuals.selection.stroke = egui::Stroke::new(1.0_f32, Color32::WHITE);
+        cc.egui_ctx.set_visuals(visuals);
+
+        let (fs_tx, fs_rx) = mpsc::channel::<FsMsg>();
+        // std::sync::mpsc::channel 本身无界：日志洪峰时读循环发送不阻塞，
+        // SSH 窗口持续回收，避免数据通道拥塞导致 Ctrl+C（0x03）排不上队
+        let (back_tx, back_rx) = mpsc::channel::<BackMsg>();
+        spawn_backend(fs_rx, back_tx);
+        Self {
+            host: String::new(),
+            port: "22".into(),
+            user: String::new(),
+            password: String::new(),
+            key_path: None,
+            remember_pwd: true,
+            accounts: load_accounts(),
+            sessions: Vec::new(),
+            active: 0,
+            next_token: 1,
+            tx: fs_tx,
+            rx: back_rx,
+            dialog: None,
+            last_focused: false,
+            dialog_input: String::new(),
+            dialog_old: String::new(),
+            transfer_log: load_transfers(),
+            show_transfer: false,
+            active_transfer: None,
+            show_files: true,
+            files_h: None,
+        }
+    }
+
+    fn send(&self, msg: FsMsg) {
+        let _ = self.tx.send(msg);
+    }
+
+    /// 当前激活标签页索引（空列表时返回 0，调用前需判空）。
+    fn active_idx(&self) -> usize {
+        if self.sessions.is_empty() {
+            0
+        } else {
+            self.active.min(self.sessions.len() - 1)
+        }
+    }
+
+    /// 从左侧账号发起连接：填充表单 + 新开标签页。
+    fn connect_account(&mut self, acc: &SavedAccount) {
+        self.host = acc.host.clone();
+        self.port = acc.port.to_string();
+        self.user = acc.user.clone();
+        self.password = acc.password.clone().unwrap_or_default();
+        self.key_path = acc.key.clone().map(PathBuf::from);
+        self.connect_with_log(true, true);
+    }
+
+    /// 发起连接。new_tab=true 时新开一个标签页；false 时复用当前标签页（自动重连）。
+    fn connect_with_log(&mut self, clear_log: bool, new_tab: bool) {
+        let host = self.host.trim().to_string();
+        if host.is_empty() {
+            self.status_set("请填写主机地址");
+            return;
+        }
+        let port: u16 = self.port.trim().parse().unwrap_or(22);
+        let user = self.user.trim().to_string();
+        let (password, key_path) = if self.key_path.is_some() {
+            (
+                None,
+                self.key_path
+                    .as_ref()
+                    .map(|p| p.to_string_lossy().into_owned()),
+            )
+        } else {
+            (Some(self.password.clone()), None)
+        };
+        let token = if new_tab {
+            let acc = self.current_account();
+            let t = self.next_token;
+            self.next_token += 1;
+            self.sessions.push(ConnTab::new(acc, t));
+            self.active = self.sessions.len() - 1;
+            t
+        } else {
+            self.sessions[self.active_idx()].token
+        };
+        let ai = self.active_idx();
+        {
+            let tab = &mut self.sessions[ai];
+            tab.connecting = true;
+            tab.manual_disconnect = false; // 用户发起连接 -> 恢复自动重连
+            tab.status = "正在连接...".into();
+            if clear_log {
+                tab.login_log.clear();
+            }
+            tab.login_log.push(format!("正在连接 {host}:{port} ..."));
+            tab.login_log.push(format!("用户 {user}，正在进行认证..."));
+        }
+        self.send(FsMsg::Connect(ConnectReq {
+            token,
+            host,
+            port,
+            user,
+            password,
+            key_path,
+        }));
+    }
+
+    /// 设置当前标签页的状态栏文本。
+    fn status_set(&mut self, s: impl Into<String>) {
+        if !self.sessions.is_empty() {
+            let i = self.active_idx();
+            self.sessions[i].status = s.into();
+        }
+    }
+
+    /// 关闭（断开）指定标签页并移除。
+    fn close_tab(&mut self, idx: usize) {
+        if idx >= self.sessions.len() {
+            return;
+        }
+        let id = self.sessions[idx].id.clone();
+        if !id.is_empty() {
+            self.send(FsMsg::For {
+                id,
+                msg: FsInner::Disconnect,
+            });
+        }
+        self.sessions.remove(idx);
+        if self.sessions.is_empty() {
+            self.active = 0;
+        } else {
+            self.active = self.active.min(self.sessions.len() - 1);
+        }
+    }
+
+    /// 当前连接表单对应的账号（内存态，密码始终保留，供自动重连使用）。
+    fn current_account(&self) -> SavedAccount {
+        let host = self.host.trim().to_string();
+        let user = self.user.trim().to_string();
+        SavedAccount {
+            name: format!("{user}@{host}"),
+            host,
+            port: self.port.trim().parse().unwrap_or(22),
+            user,
+            password: if self.key_path.is_some() {
+                None
+            } else if self.password.is_empty() {
+                None
+            } else {
+                Some(self.password.clone())
+            },
+            key: self
+                .key_path
+                .as_ref()
+                .map(|p| p.to_string_lossy().into_owned()),
+        }
+    }
+
+    fn pump(&mut self) {
+        while let Ok(msg) = self.rx.try_recv() {
+            match msg {
+                BackMsg::Connected(Ok((token, id))) => {
+                    // 按 token 匹配发起连接的标签页
+                    if let Some(idx) = self.sessions.iter().position(|t| t.token == token) {
+                        {
+                            let tab = &mut self.sessions[idx];
+                            tab.id = id;
+                            tab.connecting = false;
+                            tab.connected = true;
+                            tab.shell_alive = true;
+                            tab.term = Some(TermState::new(24, 80));
+                            tab.login_log.clear(); // 登录完成，进入真实终端
+                            tab.reconnect_attempts = 0; // 重连成功，重置计数
+                            tab.status = "已连接，正在加载目录...".into();
+                            tab.cwd = "/".into();
+                            tab.selected = None;
+                            tab.sysinfo.clear();
+                            tab.user_navigated = false; // 新连接重新开启终端路径自动联动
+                            tab.sync_timer = 0.0;
+                            tab.focus_term = true; // 连接成功后键盘焦点交给命令行
+                        }
+                        // 全局动作：账号自动保存 + 初始目录与系统信息
+                        self.save_current_account();
+                        let id2 = self.sessions[idx].id.clone();
+                        self.send(FsMsg::For {
+                            id: id2,
+                            msg: FsInner::List("/".into()),
+                        });
+                        let id2 = self.sessions[idx].id.clone();
+                        self.send(FsMsg::For {
+                            id: id2,
+                            msg: FsInner::SysInfo,
+                        });
+                    }
+                }
+                BackMsg::Connected(Err((token, e))) => {
+                    if let Some(tab) = self.sessions.iter_mut().find(|t| t.token == token) {
+                        tab.connecting = false;
+                        tab.status = format!("连接失败：{e}");
+                        tab.login_log.push(format!("✗ 连接失败：{e}"));
+                    }
+                }
+                BackMsg::Log(s) => {
+                    if !self.sessions.is_empty() {
+                        let i = self.active_idx();
+                        self.sessions[i].status = s;
+                    }
+                }
+                BackMsg::Progress { up, done, total } => {
+                    // 更新最近一条对应方向的进行中记录进度（不落盘，进程退出即中断）
+                    for r in self.transfer_log.iter_mut().rev() {
+                        if r.up == up && !r.ok && r.detail == "进行中..." {
+                            r.progress = Some((done, total));
+                            break;
+                        }
+                    }
+                }
+                BackMsg::TransferStart { up } => {
+                    self.active_transfer = Some(up);
+                }
+                BackMsg::For { id, msg } => {
+                    // Ping 失效 -> 自动重连；其余按会话路由
+                    match msg {
+                        BackInner::Ping(Err(e)) => self.handle_ping_fail(&id, e),
+                        m => self.handle_back(&id, m),
+                    }
+                }
+            }
+        }
+    }
+
+    /// Ping 探针失效：自动重连（复用本标签页），除非用户手动断开或次数超限。
+    fn handle_ping_fail(&mut self, id: &str, e: String) {
+        let idx = match self.sessions.iter().position(|t| t.id == id) {
+            Some(i) => i,
+            None => return,
+        };
+        if self.sessions[idx].manual_disconnect || self.sessions[idx].reconnect_attempts >= 3 {
+            let tab = &mut self.sessions[idx];
+            tab.connected = false;
+            tab.shell_alive = false;
+            tab.term = None;
+            tab.login_log.push(format!("✗ 连接已失效：{e}"));
+            tab.login_log.push("已停止自动重连，请手动连接".into());
+            tab.status = format!("连接已失效：{e}（已停止自动重连）");
+            return;
+        }
+        self.sessions[idx].reconnect_attempts += 1;
+        {
+            let tab = &mut self.sessions[idx];
+            tab.connected = false;
+            tab.shell_alive = false;
+            tab.term = None;
+            tab.login_log.push(format!("✗ 连接已失效：{e}"));
+            tab.login_log.push(format!(
+                "正在自动重连（第 {} 次）...",
+                tab.reconnect_attempts
+            ));
+            tab.status = format!(
+                "连接失效，自动重连（第 {} 次）...",
+                tab.reconnect_attempts
+            );
+        }
+        // 清理失效会话，然后复用本标签页重连
+        let old_id = self.sessions[idx].id.clone();
+        self.send(FsMsg::For {
+            id: old_id,
+            msg: FsInner::Disconnect,
+        });
+        let acc = self.sessions[idx].account.clone();
+        self.host = acc.host;
+        self.port = acc.port.to_string();
+        self.user = acc.user;
+        self.password = acc.password.clone().unwrap_or_default();
+        self.key_path = acc.key.map(PathBuf::from);
+        self.active = idx;
+        self.connect_with_log(false, false); // 保留失效提示日志
+    }
+
+    /// 按会话 id 处理各后端响应（tab 状态 + 全局传输记录）。
+    fn handle_back(&mut self, id: &str, msg: BackInner) {
+        let idx = match self.sessions.iter().position(|t| t.id == id) {
+            Some(i) => i,
+            None => return,
+        };
+        match msg {
+            BackInner::Disconnected => {
+                let tab = &mut self.sessions[idx];
+                tab.connected = false;
+                tab.shell_alive = false;
+                tab.term = None;
+                tab.status = "已断开".to_string();
+            }
+            BackInner::List(Ok(v)) => {
+                let tab = &mut self.sessions[idx];
+                tab.entries = v;
+                tab.last_ok_cwd = Some(tab.cwd.clone());
+                tab.status = format!("{} 项", tab.entries.len());
+                // 异步 Tab 补全：目录列表到达后，若等待目录与当前终端目录一致则执行补全
+                let wait_word = tab.pending_tab_word.clone();
+                let wait_dir = tab.pending_tab_dir.clone();
+                tab.pending_tab_word = None;
+                tab.pending_tab_dir = None;
+                if let (Some(w), Some(d)) = (wait_word, wait_dir) {
+                    let (term_cwd, line, entries, id) = {
+                        let t = &self.sessions[idx];
+                        (
+                            t.term.as_ref().and_then(|tm| tm.term_cwd.clone()),
+                            t.term.as_ref().map(|tm| String::from_utf8_lossy(&tm.pending_line).into_owned()).unwrap_or_default(),
+                            t.entries.clone(),
+                            t.id.clone(),
+                        )
+                    };
+                    if term_cwd.as_deref() == Some(d.as_str()) && last_word(&line) == w.as_str() {
+                        if let Some((out, new_line)) = build_tab_completion(&entries, &line) {
+                            if let Some(term) = &mut self.sessions[idx].term {
+                                term.pending_line = new_line.into_bytes();
+                            }
+                            self.send(FsMsg::For {
+                                id,
+                                msg: FsInner::ShellInput(out),
+                            });
+                        }
+                    }
+                }
+            }
+            BackInner::List(Err(e)) => {
+                // 清理挂起的 Tab 补全（列表获取失败）
+                self.sessions[idx].pending_tab_word = None;
+                self.sessions[idx].pending_tab_dir = None;
+                // cd 联动到不存在目录等失败场景：回滚到最近一次成功加载的目录
+                let mut reload_path: Option<String> = None;
+                {
+                    let tab = &mut self.sessions[idx];
+                    if let Some(ok) = tab.last_ok_cwd.clone() {
+                        if tab.cwd != ok {
+                            let msg = format!("读取目录失败：{e}（已回到 {ok}）");
+                            tab.cwd = ok;
+                            tab.status = msg;
+                            reload_path = Some(tab.cwd.clone());
+                        } else {
+                            tab.status = format!("读取目录失败：{e}");
+                        }
+                    } else {
+                        tab.status = format!("读取目录失败：{e}");
+                    }
+                }
+                if let Some(p) = reload_path {
+                    let id2 = self.sessions[idx].id.clone();
+                    self.send(FsMsg::For {
+                        id: id2,
+                        msg: FsInner::List(p),
+                    });
+                }
+            }
+            BackInner::Mkdir(Ok(())) => {
+                self.sessions[idx].status = "目录已创建".into();
+                self.reload_tab(idx);
+            }
+            BackInner::Mkdir(Err(e)) => {
+                self.sessions[idx].status = format!("创建目录失败：{e}");
+            }
+            BackInner::Remove(Ok(())) => {
+                self.sessions[idx].selected = None;
+                self.sessions[idx].status = "已删除".into();
+                self.reload_tab(idx);
+            }
+            BackInner::Remove(Err(e)) => {
+                self.sessions[idx].status = format!("删除失败：{e}");
+            }
+            BackInner::Rename(Ok(())) => {
+                self.sessions[idx].selected = None;
+                self.sessions[idx].status = "已重命名".into();
+                self.reload_tab(idx);
+            }
+            BackInner::Rename(Err(e)) => {
+                self.sessions[idx].status = format!("重命名失败：{e}");
+            }
+            BackInner::Upload(Ok(n)) => {
+                self.active_transfer = None;
+                finish_transfer(&mut self.transfer_log, true, Some(n), true, "完成".to_string());
+                self.sessions[idx].status = if n > 0 {
+                    format!("上传完成（{}）", fmt_size(n))
+                } else {
+                    "上传完成".into()
+                };
+                self.reload_tab(idx);
+            }
+            BackInner::Upload(Err(e)) => {
+                self.active_transfer = None;
+                finish_transfer(&mut self.transfer_log, true, None, false, e.clone());
+                self.sessions[idx].status = format!("上传失败：{e}");
+            }
+            BackInner::Download(Ok(n)) => {
+                self.active_transfer = None;
+                finish_transfer(&mut self.transfer_log, false, Some(n), true, "完成".to_string());
+                self.sessions[idx].status = if n > 0 {
+                    format!("下载完成（{}）", fmt_size(n))
+                } else {
+                    "下载完成".into()
+                };
+            }
+            BackInner::Download(Err(e)) => {
+                self.active_transfer = None;
+                finish_transfer(&mut self.transfer_log, false, None, false, e.clone());
+                self.sessions[idx].status = format!("下载失败：{e}");
+            }
+            BackInner::ShellData(data) => {
+                if let Some(t) = &mut self.sessions[idx].term {
+                    t.feed(&data);
+                }
+            }
+            BackInner::ShellClosed => {
+                let tab = &mut self.sessions[idx];
+                tab.shell_alive = false;
+                if tab.connected {
+                    tab.status = "远端 shell 已退出（可重新连接）".into();
+                }
+            }
+            BackInner::SysInfo(Ok(info)) => {
+                self.sessions[idx].sysinfo = info;
+                self.sessions[idx].status = "已获取系统信息".into();
+            }
+            BackInner::SysInfo(Err(e)) => {
+                self.sessions[idx].status = format!("获取系统信息失败：{e}");
+            }
+            BackInner::Ping(Ok(())) => {}
+            BackInner::Ping(Err(_)) => {} // 已在 pump 主循环按自动重连处理
+        }
+    }
+
+    fn reload_tab(&mut self, idx: usize) {
+        let p = self.sessions[idx].cwd.clone();
+        let id = self.sessions[idx].id.clone();
+        self.send(FsMsg::For {
+            id,
+            msg: FsInner::List(p),
+        });
+    }
+
+    fn navigate(&mut self, path: String) {
+        if self.sessions.is_empty() {
+            return;
+        }
+        let idx = self.active_idx();
+        self.sessions[idx].cwd = path.clone();
+        self.sessions[idx].selected = None;
+        self.sessions[idx].status = "加载中...".into();
+        let id = self.sessions[idx].id.clone();
+        self.send(FsMsg::For {
+            id,
+            msg: FsInner::List(path),
+        });
+    }
+
+    fn reload(&mut self) {
+        if self.sessions.is_empty() {
+            return;
+        }
+        let idx = self.active_idx();
+        let p = self.sessions[idx].cwd.clone();
+        let id = self.sessions[idx].id.clone();
+        self.send(FsMsg::For {
+            id,
+            msg: FsInner::List(p),
+        });
+    }
+
+    /// 更新最近一条未完成传输的结果；找不到则兜底追加一条。
+    fn start_transfer(&mut self, up: bool, name: String, is_dir: bool) {
+        self.transfer_log.push(TransferRec {
+            time: now_hms(),
+            up,
+            name,
+            size: None,
+            ok: false,
+            detail: "进行中...".to_string(),
+            progress: None,
+            is_dir,
+        });
+        // 只保留最近 200 条
+        if self.transfer_log.len() > 200 {
+            let keep = self.transfer_log.split_off(self.transfer_log.len() - 200);
+            self.transfer_log = keep;
+        }
+        persist_transfers(&self.transfer_log);
+    }
+
+    /// 把当前连接表单保存为一条本地账号（连接成功后调用）。
+    /// 文件里是否保存密码由「记住密码」决定。
+    fn save_current_account(&mut self) {
+        if self.host.trim().is_empty() || self.user.trim().is_empty() {
+            return;
+        }
+        let mut acc = self.current_account();
+        if !self.remember_pwd {
+            acc.password = None;
+        }
+        let host = acc.host.clone();
+        let user = acc.user.clone();
+        upsert_account(&mut self.accounts, acc);
+        save_accounts(&self.accounts);
+        if !self.sessions.is_empty() {
+            let i = self.active_idx();
+            self.sessions[i].status = format!("账号 {user}@{host} 已保存到本地");
+        }
+    }
+}
+
+impl eframe::App for SshApp {
+    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.pump();
+
+        // 焦点管理：3F-Shell 获得焦点时注册全局热键 Ctrl+C（必达），失焦时注销
+        // （避免影响其他程序的 Ctrl+C 复制等行为）
+        #[cfg(target_os = "windows")]
+        {
+            let focused = ctx.input(|i| i.focused);
+            if focused != self.last_focused {
+                self.last_focused = focused;
+                if focused {
+                    kbhook::register_hotkey();
+                } else {
+                    kbhook::unregister_hotkey();
+                }
+            }
+        }
+
+        // 自动保活 / 系统信息刷新 / 终端路径定时同步：仅对当前激活标签页推进计时
+        let dt = ctx.input(|i| i.stable_dt) as f64;
+        if !self.sessions.is_empty() {
+            let idx = self.active_idx();
+            let (connected, connecting, manual, ping, sys, sync, nav_ok, term_cwd) = {
+                let t = &self.sessions[idx];
+                (
+                    t.connected,
+                    t.connecting,
+                    t.manual_disconnect,
+                    t.ping_timer,
+                    t.sysinfo_timer,
+                    t.sync_timer,
+                    !t.user_navigated,
+                    t.term.as_ref().and_then(|tm| tm.term_cwd.clone()),
+                )
+            };
+            if connected && !connecting && !manual {
+                if ping + dt >= 30.0 {
+                    let id = self.sessions[idx].id.clone();
+                    self.send(FsMsg::For { id, msg: FsInner::Ping });
+                    self.sessions[idx].ping_timer = 0.0;
+                } else {
+                    self.sessions[idx].ping_timer = ping + dt;
+                }
+                if sys + dt >= 5.0 {
+                    let id = self.sessions[idx].id.clone();
+                    self.send(FsMsg::For { id, msg: FsInner::SysInfo });
+                    self.sessions[idx].sysinfo_timer = 0.0;
+                } else {
+                    self.sessions[idx].sysinfo_timer = sys + dt;
+                }
+                // 未手动导航时：每 3 秒把终端当前目录同步到文件面板
+                if sync + dt >= 3.0 {
+                    self.sessions[idx].sync_timer = 0.0;
+                    if nav_ok {
+                        if let Some(tc) = term_cwd {
+                            let cur = self.sessions[idx].cwd.clone();
+                            if tc != cur {
+                                self.sessions[idx].cwd = tc;
+                                self.sessions[idx].selected = None;
+                                self.sessions[idx].status = "已跟随终端目录".into();
+                                self.reload_tab(idx);
+                            }
+                        }
+                    }
+                } else {
+                    self.sessions[idx].sync_timer = sync + dt;
+                }
+            }
+        }
+        // 空闲时也保持重绘，保证计时器推进
+        ctx.request_repaint_after(std::time::Duration::from_secs(1));
+
+        // 顶部标签栏：多连接切换 / 关闭（高度固定，连接后不撑高）
+        egui::TopBottomPanel::top("tab_bar")
+            .exact_height(30.0)
+            .frame(compact_frame())
+            .show(ctx, |ui| tab_bar(ui, self));
+
+        // 左侧栏：已存账号 + 状态 + 远端系统信息（连接/断开全部在左侧操作）
+        egui::SidePanel::left("left_panel")
+            .resizable(true)
+            .default_width(210.0)
+            .frame(compact_frame())
+            .show(ctx, |ui| left_panel(ui, self));
+
+        // 文件面板：高度完全由用户手动拖动分隔条控制（无拖动时保持不变）。
+        // 默认高度首次按窗口一半固定；之后仅拖动分隔条时更新。
+        if self.files_h.is_none() {
+            self.files_h = Some((ctx.available_rect().height() * 0.5).clamp(120.0, 900.0));
+        }
+        if self.show_files {
+            egui::TopBottomPanel::bottom("files_panel")
+                .exact_height(self.files_h.unwrap_or(360.0))
+                .frame(compact_frame())
+                .show(ctx, |ui| files_panel(ui, self));
+        } else {
+            // 关闭时底部保留标签条（白纸黑字风格，浅色底 + 黑色字体），点击重新展开
+            let tab_frame = egui::Frame::new()
+                .fill(Color32::from_rgb(245, 245, 248))
+                .inner_margin(egui::Margin::symmetric(6, 2));
+            egui::TopBottomPanel::bottom("files_tab")
+                .exact_height(26.0)
+                .frame(tab_frame)
+                .show(ctx, |ui| {
+                    ui.visuals_mut().override_text_color = Some(Color32::from_rgb(20, 20, 20));
+                    ui.vertical_centered(|ui| {
+                        let btn = ui
+                            .add(
+                                egui::Button::new(
+                                    RichText::new("📂 文件操作区域（点击展开）")
+                                        .color(Color32::from_rgb(20, 20, 20)),
+                                )
+                                .small(),
+                            )
+                            .on_hover_text("点击重新打开文件操作区域");
+                        if btn.clicked() {
+                            self.show_files = true;
+                        }
+                    });
+                });
+        }
+
+        // 终端区域吃掉全部剩余空间，避免底部留白
+        egui::CentralPanel::default()
+            .frame(compact_frame())
+            .show(ctx, |ui| term_panel(ui, self));
+
+        // 模态对话框
+        if let Some(kind) = self.dialog {
+            let title = match kind {
+                DialogKind::Mkdir => "新建目录",
+                DialogKind::Rename => "重命名",
+                DialogKind::ConfirmDelete => "确认删除",
+                DialogKind::NewAccount => "新增账号",
+            };
+            let mut open = true;
+            egui::Window::new(title)
+                .collapsible(false)
+                .resizable(false)
+                .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+                .open(&mut open)
+                .show(ctx, |ui| match kind {
+                    DialogKind::Mkdir => {
+                        ui.label("目录名：");
+                        ui.add(egui::TextEdit::singleline(&mut self.dialog_input).desired_width(260.0));
+                        ui.add_space(6.0);
+                        ui.horizontal(|ui| {
+                            if ui.button("创建").clicked() {
+                                let name = self.dialog_input.trim().to_string();
+                                self.dialog = None;
+                                if !name.is_empty() {
+                                    if self.sessions.is_empty() {
+                                        self.dialog_input = name;
+                                    } else {
+                                        let idx = self.active_idx();
+                                        let p = join_path(&self.sessions[idx].cwd, &name);
+                                        let id = self.sessions[idx].id.clone();
+                                        self.status_set("创建中...");
+                                        self.send(FsMsg::For { id, msg: FsInner::Mkdir(p) });
+                                    }
+                                }
+                            }
+                            if ui.button("取消").clicked() {
+                                self.dialog = None;
+                            }
+                        });
+                    }
+                    DialogKind::Rename => {
+                        let old_name = self
+                            .dialog_old
+                            .rsplit('/')
+                            .next()
+                            .unwrap_or("")
+                            .to_string();
+                        ui.label(format!("将「{old_name}」重命名为："));
+                        ui.add(egui::TextEdit::singleline(&mut self.dialog_input).desired_width(260.0));
+                        ui.add_space(6.0);
+                        ui.horizontal(|ui| {
+                            if ui.button("确定").clicked() {
+                                let new_name = self.dialog_input.trim().to_string();
+                                let old = self.dialog_old.clone();
+                                self.dialog = None;
+                                if !new_name.is_empty() {
+                                    if self.sessions.is_empty() {
+                                        self.dialog_input = new_name;
+                                    } else {
+                                        let idx = self.active_idx();
+                                        let newp = join_path(&self.sessions[idx].cwd, &new_name);
+                                        let id = self.sessions[idx].id.clone();
+                                        self.status_set("重命名中...");
+                                        self.send(FsMsg::For { id, msg: FsInner::Rename(old, newp) });
+                                    }
+                                }
+                            }
+                            if ui.button("取消").clicked() {
+                                self.dialog = None;
+                            }
+                        });
+                    }
+                    DialogKind::ConfirmDelete => {
+                        let name = self.dialog_old.rsplit('/').next().unwrap_or("").to_string();
+                        ui.label(format!("确定删除「{name}」？"));
+                        ui.label(RichText::new("目录将连同全部内容递归删除，且不可恢复").weak().small());
+                        ui.add_space(6.0);
+                        ui.horizontal(|ui| {
+                            if ui
+                                .button(RichText::new("删除").color(Color32::LIGHT_RED))
+                                .clicked()
+                            {
+                                let p = self.dialog_old.clone();
+                                self.dialog = None;
+                                if !self.sessions.is_empty() {
+                                    let idx = self.active_idx();
+                                    let id = self.sessions[idx].id.clone();
+                                    self.status_set("删除中...");
+                                    self.send(FsMsg::For { id, msg: FsInner::Remove(p) });
+                                }
+                            }
+                            if ui.button("取消").clicked() {
+                                self.dialog = None;
+                            }
+                        });
+                    }
+                    DialogKind::NewAccount => {
+                        ui.label("名称（可选，留空自动生成 用户@主机）：");
+                        ui.add(egui::TextEdit::singleline(&mut self.dialog_input).desired_width(260.0));
+                        ui.add_space(4.0);
+                        ui.label("主机（必填）：");
+                        ui.add(egui::TextEdit::singleline(&mut self.host).desired_width(260.0).hint_text("192.168.1.100"));
+                        ui.label("端口：");
+                        ui.add(egui::TextEdit::singleline(&mut self.port).desired_width(120.0));
+                        ui.label("用户（必填）：");
+                        ui.add(egui::TextEdit::singleline(&mut self.user).desired_width(260.0).hint_text("root"));
+                        ui.label("密码（可留空，与密钥二选一）：");
+                        ui.add(egui::TextEdit::singleline(&mut self.password).password(true).desired_width(260.0));
+                        ui.checkbox(&mut self.remember_pwd, "记住密码（明文保存到本地）");
+                        ui.horizontal(|ui| {
+                            if ui.button("选择密钥...").clicked() {
+                                if let Some(p) = rfd::FileDialog::new()
+                                    .add_filter("私钥", &["pem", "key"])
+                                    .pick_file()
+                                {
+                                    self.key_path = Some(p);
+                                }
+                            }
+                            if let Some(kp) = &self.key_path {
+                                let name = kp
+                                    .file_name()
+                                    .map(|n| n.to_string_lossy().into_owned())
+                                    .unwrap_or_default();
+                                ui.weak(format!("密钥:{name}"));
+                            }
+                        });
+                        ui.add_space(6.0);
+                        ui.horizontal(|ui| {
+                            if ui.button("保存").clicked() {
+                                let host = self.host.trim().to_string();
+                                let user = self.user.trim().to_string();
+                                if host.is_empty() || user.is_empty() {
+                                    self.status_set("主机和用户不能为空");
+                                } else {
+                                    let port = self.port.trim().parse().unwrap_or(22);
+                                    let name = self.dialog_input.trim();
+                                    let name = if name.is_empty() {
+                                        format!("{user}@{host}")
+                                    } else {
+                                        name.to_string()
+                                    };
+                                    let key = self
+                                        .key_path
+                                        .as_ref()
+                                        .map(|p| p.to_string_lossy().into_owned());
+                                    let password = if key.is_some() {
+                                        None
+                                    } else if self.remember_pwd && !self.password.is_empty() {
+                                        Some(self.password.clone())
+                                    } else {
+                                        None
+                                    };
+                                    upsert_account(
+                                        &mut self.accounts,
+                                        SavedAccount {
+                                            name,
+                                            host,
+                                            port,
+                                            user,
+                                            password,
+                                            key,
+                                        },
+                                    );
+                                    save_accounts(&self.accounts);
+                                    self.dialog = None;
+                                    self.status_set("账号已保存到本地，点击左侧账号即可连接");
+                                }
+                            }
+                            if ui.button("取消").clicked() {
+                                self.dialog = None;
+                            }
+                        });
+                    }
+                });
+            if !open {
+                self.dialog = None;
+            }
+        }
+    }
+}
+
+// =====================================================================
+// 顶部标签栏（多连接切换 / 关闭）
+// =====================================================================
+
+fn tab_bar(ui: &mut egui::Ui, app: &mut SshApp) {
+    ui.horizontal(|ui| {
+        ui.add_space(2.0);
+        ui.strong(RichText::new("连接").color(Color32::WHITE));
+        ui.separator();
+        if app.sessions.is_empty() {
+            ui.weak("未打开任何连接：点击左侧账号或「＋ 新增」发起连接");
+        } else {
+            let mut switch: Option<usize> = None;
+            let mut close: Option<usize> = None;
+            let n = app.sessions.len();
+            let tab_h = 24.0;
+            let radius = 3.0;
+            let font_id = FontId::proportional(13.0);
+            // 第一遍：按文本宽度预计算每个标签宽度（状态点 + 文本 + X 按钮 + 内边距）
+            // 宽度缩小一半左右：文本区减半，固定元素（状态点/边距/X 区）保持不变
+            let mut widths: Vec<f32> = Vec::with_capacity(n);
+            for i in 0..n {
+                let t = &app.sessions[i];
+                let label_full = format!("{}（{}）", t.account.name, t.account.host);
+                let w_full = ui
+                    .fonts(|f| f.layout_no_wrap(label_full, font_id.clone(), Color32::WHITE))
+                    .size()
+                    .x;
+                widths.push(w_full * 0.5 + 12.0 + 9.0 + 5.0);
+            }
+            for i in 0..n {
+                let (rect, resp) = ui.allocate_exact_size(
+                    egui::vec2(widths[i], tab_h),
+                    Sense::click(),
+                );
+                let sel = i == app.active_idx();
+                let t = &app.sessions[i];
+                let dot_c = if t.connecting {
+                    Color32::from_rgb(255, 195, 70) // 连接中：黄
+                } else if t.connected {
+                    Color32::from_rgb(96, 205, 120) // 已连接：绿
+                } else {
+                    Color32::from_rgb(130, 130, 140) // 未连接：灰
+                };
+                let (label_c, bg, border) = if sel {
+                    (
+                        Color32::WHITE,
+                        Color32::from_rgb(36, 66, 112),
+                        Color32::from_rgb(110, 170, 255),
+                    )
+                } else if resp.hovered() {
+                    (
+                        Color32::from_gray(235),
+                        Color32::from_rgb(56, 56, 62),
+                        Color32::from_rgb(86, 86, 94),
+                    )
+                } else {
+                    (
+                        Color32::from_gray(195),
+                        Color32::from_rgb(44, 44, 48),
+                        Color32::from_rgb(62, 62, 68),
+                    )
+                };
+                let painter = ui.painter();
+                painter.rect_filled(rect, radius, bg);
+                painter.rect_stroke(rect, radius, Stroke::new(1.0_f32, border), StrokeKind::Inside);
+                // 状态圆点
+                painter.circle_filled(
+                    egui::pos2(rect.left() + 6.0, rect.center().y),
+                    2.0,
+                    dot_c,
+                );
+                // 标签文本（宽度减半后按可用宽度截断，避免溢出到相邻标签）
+                let label_full = format!("{}（{}）", t.account.name, t.account.host);
+                let w_full = ui
+                    .fonts(|f| f.layout_no_wrap(label_full.clone(), font_id.clone(), Color32::WHITE))
+                    .size()
+                    .x;
+                let avail = (w_full * 0.5).max(8.0);
+                let max_cw = ((avail / 7.0) as usize).max(4);
+                let label = truncate_wide(&label_full, max_cw);
+                painter.text(
+                    egui::pos2(rect.left() + 12.0, rect.center().y),
+                    Align2::LEFT_CENTER,
+                    label,
+                    font_id.clone(),
+                    label_c,
+                );
+                // X 关闭按钮（独立可点击区域，悬停变红）
+                let x_rect = Rect::from_min_max(
+                    egui::pos2(rect.right() - 12.0, rect.top() + 1.5),
+                    egui::pos2(rect.right() - 3.0, rect.bottom() - 1.5),
+                );
+                let x_resp = ui.interact(x_rect, ui.id().with(i).with("close"), Sense::click());
+                if x_resp.hovered() {
+                    painter.rect_filled(x_rect, 2.0, Color32::from_rgb(190, 60, 50));
+                }
+                painter.text(
+                    x_rect.center(),
+                    Align2::CENTER_CENTER,
+                    "×",
+                    FontId::proportional(13.0),
+                    if x_resp.hovered() {
+                        Color32::WHITE
+                    } else {
+                        Color32::from_gray(215)
+                    },
+                );
+                if x_resp.clicked() {
+                    close = Some(i);
+                }
+                if resp.clicked() {
+                    switch = Some(i);
+                }
+                ui.add_space(4.0);
+            }
+            // 循环外统一处理（先关后切，避免索引错位）
+            if let Some(i) = close {
+                app.close_tab(i);
+            }
+            if let Some(i) = switch {
+                if i < app.sessions.len() {
+                    app.active = i;
+                    app.sessions[i].focus_term = true; // 切换到该连接时，键盘焦点交给命令行
+                }
+            }
+            ui.add_space(2.0);
+        }
+    });
+}
+
+// =====================================================================
+// 左侧栏（已存账号 + 状态 + 远端系统信息）
+// =====================================================================
+
+fn left_panel(ui: &mut egui::Ui, app: &mut SshApp) {
+    // ---- 已存账号 ----
+    ui.horizontal(|ui| {
+        ui.strong(RichText::new("已存账号").color(Color32::WHITE));
+        if ui.small_button("＋ 新增").clicked() {
+            app.dialog_input.clear();
+            app.dialog = Some(DialogKind::NewAccount);
+        }
+    });
+    ui.separator();
+    if app.accounts.is_empty() {
+        ui.weak("暂无账号，点「＋ 新增」添加");
+    }
+    let mut remove_idx: Option<usize> = None;
+    let mut to_connect: Option<SavedAccount> = None;
+    // 每个账号单行展示；最多 8 行，超出部分用滚动条查看
+    egui::ScrollArea::vertical()
+        .max_height(8.0 * 20.0 + 2.0)
+        .auto_shrink([false, false])
+        .show(ui, |ui| {
+            for (i, a) in app.accounts.iter().enumerate() {
+                let label0 = format!("{}  {}", a.name, a.host);
+                let btn_w = (ui.available_width() - 26.0).max(70.0);
+                let max_cw = ((btn_w / 7.4) as usize).max(6); // 13px 字体半角字符宽约 7.4px
+                let label = truncate_wide(&label0, max_cw);
+                let active = app.sessions.iter().any(|t| {
+                    t.account.host == a.host
+                        && t.account.port == a.port
+                        && t.account.user == a.user
+                });
+                let btn = if active {
+                    egui::Button::new(RichText::new(label).strong())
+                } else {
+                    egui::Button::new(label)
+                };
+                let mut clicked = false;
+                let mut del = false;
+                ui.horizontal(|ui| {
+                    clicked = ui.add_sized([btn_w, 18.0], btn).clicked();
+                    del = ui.small_button("×").clicked();
+                });
+                if clicked {
+                    to_connect = Some(a.clone());
+                }
+                if del {
+                    remove_idx = Some(i);
+                }
+            }
+        });
+    // 循环外统一处理，避免与 app.accounts 的迭代借用冲突
+    if let Some(a) = to_connect {
+        // 已打开同账号连接 -> 切到对应标签页；否则新开连接
+        let existing = app.sessions.iter().position(|t| {
+            t.account.host == a.host && t.account.port == a.port && t.account.user == a.user
+        });
+        match existing {
+            Some(i) => {
+                app.active = i;
+                if !app.sessions.is_empty() {
+                    app.sessions[i].status = "已切换到该连接".into();
+                }
+            }
+            None => app.connect_account(&a),
+        }
+    }
+    if let Some(i) = remove_idx {
+        app.accounts.remove(i);
+        save_accounts(&app.accounts);
+        app.status_set("账号已删除");
+    }
+    ui.add_space(6.0);
+
+    // ---- 状态 ----
+    ui.strong(RichText::new("状态").color(Color32::WHITE));
+    ui.separator();
+    // 断开连接栏最上面：展示当前连接标签页的名称与 IP（有连接时显示）
+    let (connected, connecting, status_text, name_text) = if let Some(t) =
+        app.sessions.get(app.active_idx())
+    {
+        (
+            t.connected,
+            t.connecting,
+            t.status.clone(),
+            Some((t.account.name.clone(), t.account.host.clone(), t.account.port)),
+        )
+    } else {
+        (false, false, "未连接".to_string(), None)
+    };
+    if connected {
+        if let Some((name, host, port)) = name_text {
+            ui.strong(
+                RichText::new(format!("{name}（{host}:{port}）"))
+                    .size(14.0)
+                    .color(Color32::WHITE),
+            );
+        }
+        ui.add_space(2.0);
+        if ui
+            .button(RichText::new("断开连接").color(Color32::LIGHT_RED))
+            .clicked()
+        {
+            let idx = app.active_idx();
+            app.close_tab(idx);
+        }
+        ui.add_space(2.0);
+    }
+    // 断开连接栏前后的状态信息统一使用白色字体
+    let (color, text) = if connected {
+        (Color32::WHITE, status_text)
+    } else if connecting {
+        (Color32::WHITE, format!("正在连接... {status_text}"))
+    } else {
+        (Color32::GRAY, status_text)
+    };
+    ui.colored_label(color, text);
+    ui.add_space(6.0);
+
+    // ---- 系统信息 ----
+    ui.strong(RichText::new("系统信息").color(Color32::WHITE));
+    ui.separator();
+    if connected {
+        let sysinfo: Vec<(String, String)> = app
+            .sessions
+            .get(app.active_idx())
+            .map(|t| t.sysinfo.clone())
+            .unwrap_or_default();
+        if sysinfo.is_empty() {
+            ui.weak("获取中...");
+        }
+        for (k, v) in &sysinfo {
+            match k.as_str() {
+                // CPU / 内存 / 硬盘：柱状图 + 详细文本
+                "CPU" | "内存" | "硬盘" => {
+                    ui.horizontal(|ui| {
+                        ui.weak(format!("{k}:"));
+                        if let Some(pct) = metric_pct(v) {
+                            ui.add(
+                                egui::ProgressBar::new(pct / 100.0)
+                                    .desired_width(160.0)
+                                    .fill(usage_color(pct))
+                                    .text(format!("{pct:.0}%")),
+                            );
+                        }
+                    });
+                    ui.weak(v.clone());
+                }
+                _ => {
+                    ui.horizontal(|ui| {
+                        ui.weak(format!("{k}:"));
+                        ui.label(v);
+                    });
+                }
+            }
+        }
+        if ui.button("刷新系统信息").clicked() {
+            let idx = app.active_idx();
+            let id = app.sessions[idx].id.clone();
+            app.send(FsMsg::For {
+                id,
+                msg: FsInner::SysInfo,
+            });
+            app.status_set("刷新系统信息中...");
+        }
+    } else {
+        ui.weak("未连接");
+    }
+}
+
+/// 从指标文本中提取百分比数值：
+/// CPU "使用率 35.2% / 空闲 64.8%" -> 35.2
+/// 内存 "已用 1023M / 共 15.1G（7%）" / 硬盘 "...（22%）" -> 7 / 22
+fn metric_pct(v: &str) -> Option<f32> {
+    if let Some(idx) = v.find("使用率") {
+        let rest = &v[idx + "使用率".len()..];
+        let num = rest.split('%').next().unwrap_or("").trim();
+        if let Ok(f) = num.parse::<f32>() {
+            return Some(f);
+        }
+    }
+    for open in ['（', '('] {
+        if let Some(oi) = v.rfind(open) {
+            let rest = &v[oi + open.len_utf8()..];
+            let num = rest.split('%').next().unwrap_or("").trim();
+            if let Ok(f) = num.parse::<f32>() {
+                return Some(f);
+            }
+        }
+    }
+    None
+}
+
+/// 按使用率分色：<60% 绿、60~85% 橙、>85% 红
+fn usage_color(pct: f32) -> Color32 {
+    if pct > 85.0 {
+        Color32::from_rgb(220, 60, 60)
+    } else if pct > 60.0 {
+        Color32::from_rgb(235, 160, 40)
+    } else {
+        Color32::from_rgb(70, 190, 100)
+    }
+}
+
+/// 当前时间 HH:MM:SS。
+fn now_hms() -> String {
+    chrono::Local::now().format("%H:%M:%S").to_string()
+}
+
+// =====================================================================
+// 终端面板（上半部分）
+// =====================================================================
+
+fn term_panel(ui: &mut egui::Ui, app: &mut SshApp) {
+    let (connected, shell_alive) = app
+        .sessions
+        .get(app.active_idx())
+        .map(|t| (t.connected, t.shell_alive))
+        .unwrap_or((false, false));
+    ui.horizontal(|ui| {
+        ui.strong(RichText::new("远程终端").color(Color32::WHITE));
+        if connected && shell_alive {
+            ui.colored_label(Color32::GREEN, "● 已连接");
+        } else if connected {
+            ui.colored_label(Color32::YELLOW, "● shell 已退出");
+        } else {
+            ui.colored_label(Color32::GRAY, "未连接");
+        }
+        // 右上角：文件面板开关 + 传输记录图标（点击在图标下方展开明细面板）
+        let mut icon_rect: Option<egui::Rect> = None;
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            let file_btn = if app.show_files { "📂 文件:开" } else { "📂 文件:关" };
+            let fbtn = ui
+                .add(egui::Button::new(file_btn).small())
+                .on_hover_text("显示 / 隐藏文件操作区域");
+            if fbtn.clicked() {
+                app.show_files = !app.show_files;
+            }
+            let icon = if app.show_transfer { "📋" } else { "📋 记录" };
+            let resp = ui
+                .add(egui::Button::new(icon).small())
+                .on_hover_text("查看上传 / 下载明细记录");
+            if resp.clicked() {
+                app.show_transfer = !app.show_transfer;
+            }
+            icon_rect = Some(resp.rect);
+        });
+        // 明细面板：直接悬挂在图标按钮下侧（浅色"白纸黑字"风格）
+        if app.show_transfer {
+            if let Some(rect) = icon_rect {
+                egui::Area::new(egui::Id::new("transfer_panel"))
+                    .fixed_pos(egui::pos2(rect.left(), rect.bottom() + 4.0))
+                    .order(egui::Order::Foreground)
+                    .show(ui.ctx(), |ui| {
+                        // 面板内临时切换为浅色主题：所有默认文字变黑
+                        ui.visuals_mut().override_text_color = Some(Color32::from_rgb(20, 20, 20));
+                        egui::Frame::popup(ui.style())
+                            .fill(Color32::from_rgb(250, 250, 252))
+                            .stroke(egui::Stroke::new(1.0_f32, Color32::from_rgb(170, 170, 180)))
+                            .corner_radius(6.0)
+                            .inner_margin(egui::Margin::same(8))
+                            .show(ui, |ui| {
+                                transfer_panel_content(ui, app);
+                            });
+                    });
+            }
+        }
+    });
+    ui.separator();
+    if app.sessions.is_empty() {
+        // 无任何连接：终端区域显示引导提示（黑底白字）
+        let avail = ui.available_size();
+        let (rect, _) = ui.allocate_exact_size(avail, egui::Sense::hover());
+        let painter = ui.painter();
+        painter.rect_filled(rect, 0.0, Color32::BLACK);
+        let font_id = FontId::monospace(13.0);
+        let galley =
+            painter.layout_no_wrap("点击左侧账号开始连接，或点「＋ 新增」录入账号".to_string(), font_id.clone(), Color32::from_rgba_unmultiplied(255, 255, 255, 160));
+        painter.galley(egui::pos2(rect.left() + 8.0, rect.top() + 8.0), galley, Color32::WHITE);
+        return;
+    }
+    let idx = app.active_idx();
+    let sid = app.sessions[idx].id.clone();
+    let user = app.sessions[idx].account.user.clone();
+    let want_focus = app.sessions[idx].focus_term;
+    if let Some(term) = &mut app.sessions[idx].term {
+        let tx = &app.tx;
+        let (nav, out_bytes, _) = render_terminal(ui, term, &user, want_focus);
+        // 键盘字节转发：Tab 键走本地补全，其余照常发送远端
+        if let Some(b) = out_bytes {
+            if let Some(tpos) = b.iter().position(|&x| x == 0x09) {
+                let before = &b[..tpos];
+                if !before.is_empty() {
+                    let _ = tx.send(FsMsg::For {
+                        id: sid.clone(),
+                        msg: FsInner::ShellInput(before.to_vec()),
+                    });
+                }
+                handle_tab(app, idx);
+            } else {
+                let _ = tx.send(FsMsg::For {
+                    id: sid.clone(),
+                    msg: FsInner::ShellInput(b),
+                });
+            }
+        }
+        // 终端联动：文件面板定位到对应目录（提示符解析出的路径权威，展开并规范化）
+        // 仅当用户未手动在文件面板打开过路径时自动跟随
+        if let Some(target) = nav {
+            let target = normalize_path(&target, ".", &user);
+            let cur_cwd = app.sessions[idx].cwd.clone();
+            let follow = app.sessions[idx].connected
+                && !app.sessions[idx].user_navigated
+                && cur_cwd != target;
+            if follow {
+                app.navigate(target);
+            }
+        }
+    } else {
+        // 未连接 / 登录过程中：终端区域显示登录信息与提示（黑底白字）
+        let avail = ui.available_size();
+        let (rect, _) = ui.allocate_exact_size(avail, egui::Sense::hover());
+        let painter = ui.painter();
+        painter.rect_filled(rect, 0.0, Color32::BLACK);
+        let font_id = FontId::monospace(13.0);
+        let mut y = rect.top() + 8.0;
+        let last = app.sessions[idx].login_log.len().saturating_sub(60);
+        for line in app.sessions[idx].login_log.iter().skip(last) {
+            let galley = painter.layout_no_wrap(line.clone(), font_id.clone(), Color32::WHITE);
+            painter.galley(egui::pos2(rect.left() + 8.0, y), galley, Color32::WHITE);
+            y += 16.0;
+            if y > rect.bottom() - 8.0 {
+                break;
+            }
+        }
+    }
+    // 全局 Ctrl+C：连接中任意焦点位置按下均作为通用中断信号发送
+    // （不依赖终端焦点 / 回看状态 / 输入法，docker logs -f 等场景必达）
+    // 双通道：① egui 事件（输入法未拦截时）② 系统级键盘钩子（输入法 OS 层拦截时兜底）
+    if app.dialog.is_none() && app.sessions[idx].term.is_some() {
+        let mut ctrl_c = ui.input(|i| {
+            i.events.iter().any(|e| {
+                matches!(e, egui::Event::Key { key: egui::Key::C, pressed: true, modifiers, .. }
+                    if modifiers.ctrl && !modifiers.shift && !modifiers.alt)
+            })
+        });
+        #[cfg(target_os = "windows")]
+        {
+            if kbhook::ctrl_c_pressed() {
+                ctrl_c = true;
+            }
+        }
+        if ctrl_c {
+            let _ = app.tx.send(FsMsg::For {
+                id: app.sessions[idx].id.clone(),
+                msg: FsInner::SigInt,
+            });
+        }
+    }
+    // 焦点需求已消费（无论终端是否就绪）
+    app.sessions[idx].focus_term = false;
+}
+
+/// 传输明细面板内容：标题行（含 ✕ 关闭）+ 可滚动明细列表。
+/// 面板为浅色"白纸黑字"风格（外层已把 override_text_color 设为黑色）。
+fn transfer_panel_content(ui: &mut egui::Ui, app: &mut SshApp) {
+    let black = Color32::from_rgb(20, 20, 20);
+    let gray = Color32::from_rgb(90, 90, 100);
+    // 面板内的按钮也切换为浅色"白纸黑字"样式
+    ui.visuals_mut().widgets.inactive.bg_fill = Color32::from_rgb(235, 235, 240);
+    ui.visuals_mut().widgets.inactive.fg_stroke = egui::Stroke::new(1.0_f32, black);
+    ui.visuals_mut().widgets.hovered.bg_fill = Color32::from_rgb(220, 220, 228);
+    ui.visuals_mut().widgets.hovered.fg_stroke = egui::Stroke::new(1.0_f32, black);
+    ui.visuals_mut().widgets.active.bg_fill = Color32::from_rgb(210, 210, 220);
+    ui.visuals_mut().widgets.active.fg_stroke = egui::Stroke::new(1.0_f32, black);
+    ui.set_min_width(440.0);
+    ui.horizontal(|ui| {
+        ui.strong(RichText::new("上传 / 下载明细").color(black));
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            if ui
+                .add(egui::Button::new("X").small())
+                .on_hover_text("关闭")
+                .clicked()
+            {
+                app.show_transfer = false;
+            }
+            if ui.button("清空").clicked() {
+                app.transfer_log.clear();
+                persist_transfers(&app.transfer_log);
+            }
+        });
+    });
+    ui.separator();
+    if app.transfer_log.is_empty() {
+        ui.label(RichText::new("暂无传输记录").color(gray));
+        return;
+    }
+    egui::ScrollArea::vertical()
+        .auto_shrink([false, false])
+        .max_height((ui.available_height() - 30.0).max(120.0))
+        .show(ui, |ui| {
+            for r in &app.transfer_log {
+                let (arrow, color) = if r.up {
+                    ("⬆", Color32::from_rgb(30, 80, 160))
+                } else {
+                    ("⬇", Color32::from_rgb(20, 110, 50))
+                };
+                let status_icon = if r.ok { "✓" } else { "✗" };
+                let status_color = if r.ok {
+                    Color32::from_rgb(20, 120, 60)
+                } else {
+                    Color32::from_rgb(190, 40, 40)
+                };
+                let size_txt = r.size.map(fmt_size).unwrap_or_else(|| "—".to_string());
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new(arrow).color(color));
+                    // 文件/文件夹矢量图标区分显示（与文件区域风格一致，浅底深色版）
+                    let (icon_rect, _) =
+                        ui.allocate_exact_size(egui::vec2(15.0, 13.0), egui::Sense::hover());
+                    paint_file_icon(ui.painter(), icon_rect, r.is_dir, false, false, true);
+                    ui.label(RichText::new(&r.name).color(black));
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        ui.label(RichText::new(status_icon).color(status_color));
+                        ui.label(RichText::new(&r.time).color(gray));
+                        ui.label(RichText::new(size_txt).color(gray));
+                        ui.label(RichText::new(&r.detail).color(gray));
+                    });
+                });
+                // 进行中：实时进度条（已传 / 总字节）
+                if !r.ok && r.detail == "进行中..." {
+                    if let Some((done, total)) = r.progress {
+                        if total > 0 {
+                            let pct = (done.min(total) as f32 / total as f32).clamp(0.0, 1.0);
+                            ui.add(
+                                egui::ProgressBar::new(pct)
+                                    .desired_width(ui.available_width() - 24.0)
+                                    .fill(Color32::from_rgb(40, 120, 220))
+                                    .text(format!(
+                                        "{:.0}%  {} / {}",
+                                        pct * 100.0,
+                                        fmt_size(done),
+                                        fmt_size(total)
+                                    )),
+                            );
+                        }
+                    }
+                    // 取消按钮：仅当前正在传输的该方向记录显示
+                    if app.active_transfer == Some(r.up) {
+                        let sid = app.sessions.get(app.active_idx()).map(|t| t.id.clone());
+                        if let Some(sid) = sid {
+                            if ui
+                                .add(egui::Button::new(RichText::new("取消").color(black)).small())
+                                .on_hover_text("取消本次传输")
+                                .clicked()
+                            {
+                                app.send(FsMsg::For {
+                                    id: sid,
+                                    msg: FsInner::CancelTransfer { up: r.up },
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+        });
+    ui.add_space(2.0);
+    ui.label(RichText::new(format!("共 {} 条", app.transfer_log.len())).color(gray));
+}
+
+/// 渲染终端；返回 (联动目标路径, 待转发的键盘字节, Ctrl+C 中断标志)。Tab 键由外层做本地补全。
+fn render_terminal(
+    ui: &mut egui::Ui,
+    term: &mut TermState,
+    user: &str,
+    want_focus: bool,
+) -> (Option<String>, Option<Vec<u8>>, bool) {
+    let mut nav: Option<String> = None;
+    let mut out_bytes: Option<Vec<u8>> = None;
+    let avail = ui.available_size();
+    let (rect, resp) = ui.allocate_exact_size(avail, egui::Sense::click_and_drag());
+    if want_focus {
+        // 连接成功 / 切换标签后，把键盘焦点直接交给终端（无需点击）
+        resp.request_focus();
+    }
+    if resp.clicked() {
+        // 点击终端正文回到最新 + 清除选择；点击右侧滚动条条带保持回看位置
+        if let Some(pos) = resp.interact_pointer_pos() {
+            if pos.x < rect.right() - 12.0 {
+                term.scroll_offset = 0;
+                term.sel = None;
+            }
+        }
+        resp.request_focus();
+    }
+    let has_focus = resp.has_focus();
+    if has_focus {
+        // 锁住终端焦点：Tab / 方向键 / Esc 全部留给终端输入，
+        // 不触发 egui 的焦点遍历（否则按 Tab 会跳到界面上的按钮）
+        ui.ctx().memory_mut(|mem| {
+            mem.set_focus_lock_filter(
+                resp.id,
+                egui::EventFilter {
+                    tab: true,
+                    horizontal_arrows: true,
+                    vertical_arrows: true,
+                    escape: true,
+                    ..Default::default()
+                },
+            );
+        });
+    }
+
+    // 终端固定黑底白字
+    let bg = Color32::BLACK;
+    let painter = ui.painter();
+    painter.rect_filled(rect, 0.0, bg);
+
+    let font_id = FontId::monospace(13.0);
+    let (cell_w, row_h) = ui.fonts(|f| (f.glyph_width(&font_id, 'M'), f.row_height(&font_id)));
+    if cell_w <= 0.0 || row_h <= 0.0 {
+        return (None, None, false);
+    }
+
+    // 按可用区域计算行列并 resize
+    let cols = ((rect.width() / cell_w).floor() as u16).max(2);
+    let rows = ((rect.height() / row_h).floor() as u16).max(2);
+    if (cols, rows) != term.dims {
+        term.dims = (cols, rows);
+        term.parser.set_size(rows, cols);
+    }
+    // 应用回看偏移；set_scrollback 内部会 clamp 到实际历史行数，回读生效值修正
+    term.parser.set_scrollback(term.scroll_offset);
+    let screen = term.parser.screen();
+    let applied = screen.scrollback();
+    if applied != term.scroll_offset {
+        term.scroll_offset = applied;
+    }
+    let (srows, scols) = screen.size();
+    let cursor = screen.cursor_position(); // (row, col)
+    let clip = painter.with_clip_rect(rect);
+
+    // 鼠标拖选（cell 尺寸已知后）：按下记录锚点，拖动实时更新范围，松开保留选择
+    if resp.drag_started() || resp.dragged() {
+        if let Some(pos) = resp.interact_pointer_pos() {
+            let cell = pos_to_cell(pos, rect, cell_w, row_h, srows, scols);
+            match term.sel {
+                Some((anchor, _)) => term.sel = Some((anchor, cell)),
+                None => term.sel = Some((cell, cell)),
+            }
+        }
+    }
+
+    for r in 0..srows {
+        let mut job = LayoutJob::default();
+        let mut seg = String::new();
+        let mut seg_fmt: Option<TextFormat> = None;
+
+        for c in 0..scols {
+            let cell = screen.cell(r, c);
+            let (text, fg, bgc, underline, italic) = match cell {
+                Some(cell) => {
+                    let mut fg = vt_color(cell.fgcolor());
+                    let mut bgc = if matches!(cell.bgcolor(), vt100::Color::Default) {
+                        Color32::BLACK
+                    } else {
+                        vt_color(cell.bgcolor())
+                    };
+                    if cell.inverse() {
+                        std::mem::swap(&mut fg, &mut bgc);
+                    }
+                    let text = if cell.contents().is_empty() {
+                        String::from(" ")
+                    } else {
+                        cell.contents()
+                    };
+                    (text, fg, bgc, cell.underline(), cell.italic())
+                }
+                None => (
+                    String::from(" "),
+                    Color32::WHITE,
+                    Color32::TRANSPARENT,
+                    false,
+                    false,
+                ),
+            };
+
+            // 光标：反色显示（回看历史时不显示，避免错位）
+            let is_cursor = (r, c) == cursor && term.scroll_offset == 0;
+            // 鼠标选中范围：蓝底白字高亮
+            let is_sel = term.sel.map_or(false, |((ar, ac), (cr, cc))| {
+                let (r0, r1) = (ar.min(cr), ar.max(cr));
+                if r < r0 || r > r1 {
+                    return false;
+                }
+                if r0 == r1 {
+                    let (c0, c1) = (ac.min(cc), ac.max(cc));
+                    c >= c0 && c <= c1
+                } else if r == r0 {
+                    c >= ac.min(scols - 1)
+                } else if r == r1 {
+                    c <= cc.min(scols - 1)
+                } else {
+                    true
+                }
+            });
+            let mut fmt = TextFormat {
+                font_id: font_id.clone(),
+                color: fg,
+                background: bgc,
+                ..Default::default()
+            };
+            if italic {
+                fmt.italics = true;
+            }
+            if underline {
+                fmt.underline = egui::Stroke::new(1.0_f32, fg);
+            }
+            if is_cursor {
+                fmt.background = Color32::from_rgb(0xf0, 0xf0, 0xf0);
+                fmt.color = Color32::from_rgb(0x10, 0x10, 0x10);
+            }
+            if is_sel && !is_cursor {
+                fmt.background = Color32::from_rgb(0x2a, 0x5a, 0xaa);
+                fmt.color = Color32::WHITE;
+            }
+
+            if seg_fmt.as_ref() == Some(&fmt) {
+                seg.push_str(&text);
+            } else {
+                if !seg.is_empty() || seg_fmt.is_some() {
+                    job.append(&seg, 0.0, seg_fmt.clone().unwrap_or_default());
+                }
+                seg = text;
+                seg_fmt = Some(fmt);
+            }
+        }
+        if !seg.is_empty() || seg_fmt.is_some() {
+            job.append(&seg, 0.0, seg_fmt.clone().unwrap_or_default());
+        }
+
+        let galley = ui.fonts(|f| f.layout_job(job));
+        let pos = egui::pos2(rect.left(), rect.top() + r as f32 * row_h);
+        clip.galley(pos, galley, Color32::WHITE);
+    }
+
+    // 右键菜单：复制选中文本 / 清除选择（只收集意图，screen 借用结束后统一处理）
+    let mut menu_copy = false;
+    let mut menu_clear = false;
+    resp.context_menu(|ui| {
+        let has_sel = term.sel.is_some();
+        if has_sel && ui.button("复制选中文本").clicked() {
+            menu_copy = true;
+            ui.close_menu();
+        }
+        if has_sel && ui.button("清除选择").clicked() {
+            menu_clear = true;
+            ui.close_menu();
+        }
+        if !has_sel {
+            ui.weak("（无选中文本）");
+        }
+    });
+
+    // 先收集键盘字节与最后一行文本，结束对 screen 的借用，再做 &mut 状态更新
+    let (bytes, copied, ctrl_c) = if has_focus {
+        if term.scroll_offset > 0 {
+            // 回看历史时：仅在真实按键时回到最新；本帧不读取输入（屏幕已偏移，避免错位转发）
+            if ui.input(|i| i.events.iter().any(|e| matches!(e, egui::Event::Key { .. }))) {
+                term.scroll_offset = 0;
+            }
+            (None, false, false)
+        } else {
+            let (b, c, cc) = term_input_bytes(ui, screen, term.sel);
+            (Some(b), c, cc)
+        }
+    } else {
+        (None, false, false)
+    };
+    let prompt_line = last_row_text(screen);
+    if copied {
+        // Ctrl+C（有选择时）/ Ctrl+Shift+C 已复制文本，清除选择
+        term.sel = None;
+    }
+    if menu_copy {
+        if let Some(t) = term.sel.and_then(|s| selected_text(&term.parser.screen(), Some(s))) {
+            ui.ctx().copy_text(t);
+        }
+        term.sel = None;
+    }
+    if menu_clear {
+        term.sel = None;
+    }
+
+    // 滚轮回看历史（仅终端区域 hover 时；向上滚 = 看历史）
+    if resp.hovered() {
+        let delta = ui.input(|i| i.raw_scroll_delta.y);
+        if delta != 0.0 {
+            let step: i64 = if delta > 0.0 { 3 } else { -3 };
+            term.scroll_offset = ((term.scroll_offset as i64) + step).max(0) as usize;
+        }
+    }
+
+    // 键盘输入：feed_input 累积输入行（cd 联动检测），字节返回给外层（Tab 由外层本地补全）
+    if let Some(bytes) = bytes {
+        if !bytes.is_empty() {
+            // 有真实输入时确保回到最新（冗余保护）
+            if term.scroll_offset > 0 {
+                term.scroll_offset = 0;
+            }
+            // 输入行中检测到 cd 命令 -> 乐观联动文件面板
+            if let Some(t) = term.feed_input(&bytes, user) {
+                term.term_cwd = Some(t.clone());
+                nav = Some(t);
+            }
+            out_bytes = Some(bytes);
+        }
+    } else {
+        // 焦点提示 / 回看历史提示（画在终端底部）
+        let hint = if term.scroll_offset > 0 {
+            "⬆ 回看历史中，输入任意键回到最新"
+        } else {
+            "点击此处获得键盘输入"
+        };
+        let painter = ui.painter();
+        let galley = painter.layout_no_wrap(
+            hint.to_string(),
+            FontId::monospace(12.0),
+            Color32::from_rgba_unmultiplied(255, 255, 255, 120),
+        );
+        let pos = egui::pos2(
+            rect.right() - galley.size().x - 8.0,
+            rect.bottom() - galley.size().y - 6.0,
+        );
+        painter.galley(pos, galley, Color32::WHITE);
+    }
+
+    // 提示符解析：远端已切换目录时（权威值）纠正文件面板位置；回看历史时跳过
+    if term.scroll_offset == 0 {
+        if let Some(t) = term.detect_prompt(&prompt_line) {
+            term.term_cwd = Some(expand_tilde(&t, user));
+            nav = Some(t);
+        }
+    }
+
+    // 右侧滚动条（回看指示 + 点击跳转）
+    draw_term_scrollbar(ui, rect, term);
+
+    (nav, out_bytes, ctrl_c)
+}
+
+/// 矢量绘制文件/文件夹小图标（替代 emoji，黑色主题下更清晰美观）。
+fn paint_file_icon(
+    painter: &egui::Painter,
+    rect: egui::Rect,
+    is_dir: bool,
+    is_symlink: bool,
+    selected: bool,
+    light_bg: bool,
+) {
+    if is_dir {
+        // 文件夹：标签 + 主体（暖金色，选中时提亮；浅色背景用深金保证对比度）
+        let tab = egui::Rect::from_min_max(
+            egui::pos2(rect.left(), rect.top() + 1.0),
+            egui::pos2(rect.left() + rect.width() * 0.58, rect.top() + 3.5),
+        );
+        let body = egui::Rect::from_min_max(
+            egui::pos2(rect.left(), rect.top() + 3.0),
+            egui::pos2(rect.right() - 1.0, rect.bottom() - 1.0),
+        );
+        let (fill, tab_c, hi_c) = if light_bg {
+            (
+                Color32::from_rgb(196, 148, 52),
+                Color32::from_rgb(172, 124, 38),
+                Color32::from_rgb(220, 178, 96),
+            )
+        } else if selected {
+            (
+                Color32::from_rgb(252, 205, 100),
+                Color32::from_rgb(235, 180, 70),
+                Color32::from_rgb(255, 228, 145),
+            )
+        } else {
+            (
+                Color32::from_rgb(235, 185, 80),
+                Color32::from_rgb(210, 160, 55),
+                Color32::from_rgb(250, 215, 130),
+            )
+        };
+        painter.rect_filled(tab, 1.5, tab_c);
+        painter.rect_filled(body, 2.0, fill);
+        let hi = egui::Rect::from_min_max(
+            egui::pos2(body.left() + 2.0, body.top() + 2.0),
+            egui::pos2(body.right() - 2.0, body.top() + 4.5),
+        );
+        painter.rect_filled(hi, 1.5, hi_c);
+    } else if is_symlink {
+        // 符号链接：蓝色圆环 + 白色箭头
+        let c = rect.center();
+        let r = (rect.width().min(rect.height()) * 0.40).max(3.5);
+        let ring = if selected {
+            Color32::from_rgb(120, 190, 255)
+        } else {
+            Color32::from_rgb(95, 165, 245)
+        };
+        painter.circle_stroke(c, r, egui::Stroke::new(1.5_f32, ring));
+        // 内部小箭头
+        let a0 = egui::pos2(c.x - 2.5, c.y + 2.5);
+        let a1 = egui::pos2(c.x + 2.5, c.y - 2.5);
+        painter.line_segment([a0, a1], egui::Stroke::new(1.2_f32, ring));
+        painter.line_segment(
+            [a1, egui::pos2(a1.x - 3.0, a1.y)],
+            egui::Stroke::new(1.2_f32, ring),
+        );
+    } else {
+        // 文件：圆角矩形 + 右下折角 + 文字线（浅色背景用深色，保证白底可见）
+        let body = egui::Rect::from_min_max(
+            egui::pos2(rect.left(), rect.top() + 1.0),
+            egui::pos2(rect.right() - 1.0, rect.bottom() - 1.0),
+        );
+        let fill = if light_bg {
+            Color32::from_rgb(96, 112, 138)
+        } else if selected {
+            Color32::from_rgb(240, 248, 255)
+        } else {
+            Color32::from_rgb(214, 224, 238)
+        };
+        painter.rect_filled(body, 2.0, fill);
+        let tri = vec![
+            egui::pos2(body.right() - 5.0, body.top()),
+            egui::pos2(body.right(), body.top() + 5.0),
+            egui::pos2(body.right() - 5.0, body.top() + 5.0),
+        ];
+        let (fold_c, line_c) = if light_bg {
+            (
+                Color32::from_rgb(52, 62, 80),
+                Color32::from_rgb(70, 84, 106),
+            )
+        } else {
+            (
+                Color32::from_rgb(120, 135, 155),
+                Color32::from_rgb(150, 165, 185),
+            )
+        };
+        painter.add(egui::Shape::convex_polygon(
+            tri,
+            fold_c,
+            egui::Stroke::NONE,
+        ));
+        painter.line_segment(
+            [
+                egui::pos2(body.left() + 2.0, body.top() + 5.5),
+                egui::pos2(body.right() - 6.0, body.top() + 5.5),
+            ],
+            egui::Stroke::new(1.0_f32, line_c),
+        );
+        painter.line_segment(
+            [
+                egui::pos2(body.left() + 2.0, body.top() + 8.0),
+                egui::pos2(body.right() - 6.0, body.top() + 8.0),
+            ],
+            egui::Stroke::new(1.0_f32, line_c),
+        );
+    }
+}
+
+/// 取终端屏幕最后一行的纯文本（用于提示符解析）。
+fn last_row_text(screen: &vt100::Screen) -> String {
+    let (rows, cols) = screen.size();
+    let mut line = String::new();
+    for c in 0..cols {
+        if let Some(cell) = screen.cell(rows.saturating_sub(1), c) {
+            line.push_str(&cell.contents());
+        }
+    }
+    line
+}
+
+/// 鼠标坐标 -> 终端字符格 (row, col)，越界自动 clamp。
+fn pos_to_cell(
+    pos: egui::Pos2,
+    rect: egui::Rect,
+    cell_w: f32,
+    row_h: f32,
+    srows: u16,
+    scols: u16,
+) -> (u16, u16) {
+    let col = ((pos.x - rect.left()) / cell_w.max(1.0)).floor() as i32;
+    let row = ((pos.y - rect.top()) / row_h.max(1.0)).floor() as i32;
+    let row = row.clamp(0, srows.saturating_sub(1) as i32) as u16;
+    let col = col.clamp(0, scols.saturating_sub(1) as i32) as u16;
+    (row, col)
+}
+
+/// 提取选中矩形范围内的文本（行间以换行拼接，行尾空格去除）。
+fn selected_text(
+    screen: &vt100::Screen,
+    sel: Option<((u16, u16), (u16, u16))>,
+) -> Option<String> {
+    let ((ar, ac), (cr, cc)) = sel?;
+    let (srows, scols) = screen.size();
+    let (r0, r1) = (ar.min(cr).min(srows.saturating_sub(1)), ar.max(cr).min(srows.saturating_sub(1)));
+    let mut lines = Vec::new();
+    for r in r0..=r1 {
+        let (c0, c1) = if r0 == r1 {
+            (ac.min(cc).min(scols.saturating_sub(1)), ac.max(cc).min(scols.saturating_sub(1)))
+        } else if r == r0 {
+            (ac.min(scols.saturating_sub(1)), scols.saturating_sub(1))
+        } else if r == r1 {
+            (0, cc.min(scols.saturating_sub(1)))
+        } else {
+            (0, scols.saturating_sub(1))
+        };
+        let mut s = String::new();
+        for c in c0..=c1 {
+            if let Some(cell) = screen.cell(r, c) {
+                s.push_str(&cell.contents());
+            } else {
+                s.push(' ');
+            }
+        }
+        lines.push(s.trim_end_matches(' ').to_string());
+    }
+    if lines.iter().all(|l| l.is_empty()) {
+        None
+    } else {
+        Some(lines.join("\n"))
+    }
+}
+
+/// 终端右侧垂直滚动条：指示回看位置，支持点击跳转（与 VtParser 历史容量一致）。
+fn draw_term_scrollbar(ui: &mut egui::Ui, rect: egui::Rect, term: &mut TermState) {
+    const MAX_SB: usize = 2000; // VtParser::new 的 scrollback 容量
+    let sb_w = 8.0;
+    let sb_rect = egui::Rect::from_min_max(
+        egui::pos2(rect.right() - sb_w - 1.0, rect.top() + 2.0),
+        egui::pos2(rect.right() - 1.0, rect.bottom() - 2.0),
+    );
+    let painter = ui.painter();
+    painter.rect_filled(sb_rect, 2.0, Color32::from_gray(30));
+
+    let vis_rows = term.dims.0 as usize;
+    let total = vis_rows + MAX_SB;
+    let max_h = sb_rect.height();
+    // 窗口/终端高度不足时 max < min 会触发 f32::clamp panic：先判定再 clamp
+    let slider_h = if max_h >= 16.0 {
+        (sb_rect.height() * (vis_rows as f32 / total.max(1) as f32)).clamp(16.0, max_h)
+    } else {
+        max_h
+    };
+    let frac = (term.scroll_offset as f32 / MAX_SB as f32).clamp(0.0, 1.0);
+    let slider_top = sb_rect.bottom() - slider_h - (sb_rect.height() - slider_h) * frac;
+    let slider_color = if term.scroll_offset > 0 {
+        Color32::from_rgb(150, 185, 255)
+    } else {
+        Color32::from_gray(115)
+    };
+    painter.rect_filled(
+        egui::Rect::from_min_max(
+            egui::pos2(sb_rect.left(), slider_top),
+            egui::pos2(sb_rect.right(), slider_top + slider_h),
+        ),
+        2.0,
+        slider_color,
+    );
+
+    // 点击滚动条跳转：点击位置越高 -> 回看越多
+    let sb_resp = ui.interact(sb_rect, ui.id().with("term_scrollbar"), egui::Sense::click());
+    if sb_resp.clicked() {
+        if let Some(pointer) = sb_resp.interact_pointer_pos() {
+            let frac2 = 1.0 - (pointer.y - sb_rect.top()) / sb_rect.height().max(1.0);
+            term.scroll_offset = (frac2 * MAX_SB as f32) as usize;
+        }
+    }
+}
+
+/// 取输入行最后一个词（空格分隔）。
+fn last_word(line: &str) -> &str {
+    match line.rfind(' ') {
+        Some(i) => &line[i + 1..],
+        None => line,
+    }
+}
+
+/// 两个字符串的最长公共前缀。
+fn common_prefix(a: &str, b: &str) -> String {
+    let mut s = String::new();
+    for (x, y) in a.chars().zip(b.chars()) {
+        if x == y {
+            s.push(x);
+        } else {
+            break;
+        }
+    }
+    s
+}
+
+/// 基于目录列表对当前输入行做 Tab 补全。
+/// 返回 (替换字节序列：退格整行 + 补全后的新行, 新行文本)；None = 不补全（交给远端 shell）。
+fn build_tab_completion(entries: &[ssh::FileEntry], line: &str) -> Option<(Vec<u8>, String)> {
+    let word = last_word(line);
+    if word.is_empty() || word.starts_with('/') || word.contains('/') || word.starts_with("~/") {
+        return None; // 空词 / 绝对路径 / 子目录路径交给远端 shell 补全
+    }
+    let matches: Vec<&ssh::FileEntry> = entries.iter().filter(|e| e.name.starts_with(word)).collect();
+    if matches.is_empty() {
+        return None;
+    }
+    let completion = if matches.len() == 1 {
+        let m = matches[0];
+        if m.is_dir {
+            format!("{}/", m.name)
+        } else {
+            m.name.clone()
+        }
+    } else {
+        // 多个匹配：补全最长公共前缀；无额外公共部分则不补全
+        let mut pfx = matches[0].name.clone();
+        for m in &matches[1..] {
+            pfx = common_prefix(&pfx, &m.name);
+            if pfx.is_empty() {
+                break;
+            }
+        }
+        if pfx.len() <= word.len() {
+            return None;
+        }
+        pfx
+    };
+    let new_line = match line.rfind(' ') {
+        Some(i) => format!("{}{}", &line[..=i], completion),
+        None => completion,
+    };
+    // 退格删除整行（按字符数），再写入补全后的行
+    let mut out = Vec::with_capacity(line.chars().count() + new_line.len());
+    for _ in 0..line.chars().count() {
+        out.push(0x08);
+    }
+    out.extend_from_slice(new_line.as_bytes());
+    Some((out, new_line))
+}
+
+/// Tab 键本地补全入口（term_panel 内调用，拥有 app 上下文）。
+fn handle_tab(app: &mut SshApp, idx: usize) {
+    let line = app.sessions[idx]
+        .term
+        .as_ref()
+        .map(|t| String::from_utf8_lossy(&t.pending_line).into_owned())
+        .unwrap_or_default();
+    let word = last_word(&line);
+    // 行首 / 绝对路径 / 子目录路径：交给远端 shell 补全
+    if line.is_empty() || word.is_empty() || word.starts_with('/') || word.contains('/') || word.starts_with("~/") {
+        send_tab(app, idx);
+        return;
+    }
+    let term_cwd = app.sessions[idx].term.as_ref().and_then(|t| t.term_cwd.clone());
+    let cwd = app.sessions[idx].cwd.clone();
+    let list_ok = term_cwd.is_some()
+        && term_cwd.as_deref() == Some(cwd.as_str())
+        && !app.sessions[idx].entries.is_empty();
+    if list_ok {
+        // 文件面板目录与终端目录一致：直接用现有列表同步补全
+        let entries = app.sessions[idx].entries.clone();
+        let line2 = line.clone();
+        let id = app.sessions[idx].id.clone();
+        if let Some((out, new_line)) = build_tab_completion(&entries, &line2) {
+            if let Some(term) = &mut app.sessions[idx].term {
+                term.pending_line = new_line.into_bytes();
+            }
+            app.send(FsMsg::For {
+                id,
+                msg: FsInner::ShellInput(out),
+            });
+        } else {
+            send_tab(app, idx);
+        }
+    } else if let Some(dir) = term_cwd {
+        // 目录列表不可用：请求远端目录列表，收到后异步补全
+        app.sessions[idx].pending_tab_word = Some(word.to_string());
+        app.sessions[idx].pending_tab_dir = Some(dir.clone());
+        let id = app.sessions[idx].id.clone();
+        app.send(FsMsg::For { id, msg: FsInner::List(dir) });
+    } else {
+        send_tab(app, idx);
+    }
+}
+
+/// 把 Tab 键转发给远端 shell（远端 readline 自行补全/列候选）。
+fn send_tab(app: &mut SshApp, idx: usize) {
+    if app.sessions[idx].connected {
+        let id = app.sessions[idx].id.clone();
+        app.send(FsMsg::For {
+            id,
+            msg: FsInner::ShellInput(vec![0x09]),
+        });
+    }
+}
+
+/// 把终端颜色映射为 egui 颜色（终端区域固定黑底白字，默认前景为纯白）。
+fn vt_color(c: vt100::Color) -> Color32 {
+    match c {
+        vt100::Color::Default => Color32::WHITE,
+        vt100::Color::Idx(i) => ansi_256(i),
+        vt100::Color::Rgb(r, g, b) => Color32::from_rgb(r, g, b),
+    }
+}
+
+fn ansi_256(i: u8) -> Color32 {
+    // xterm 256 色：16 基础色 + 6x6x6 立方体 + 24 级灰度
+    const BASE: [[u8; 3]; 16] = [
+        [0x00, 0x00, 0x00], // Black
+        [0xcd, 0x31, 0x31], // Red
+        [0x0d, 0xb2, 0x5a], // Green
+        [0xcd, 0xcd, 0x00], // Yellow
+        [0x34, 0x65, 0xa4], // Blue
+        [0xcd, 0x53, 0xcd], // Magenta
+        [0x00, 0xcd, 0xcd], // Cyan
+        [0xe5, 0xe5, 0xe5], // White
+        [0x66, 0x66, 0x66], // BrightBlack
+        [0xff, 0x55, 0x55], // BrightRed
+        [0x5f, 0xff, 0x5f], // BrightGreen
+        [0xff, 0xff, 0x55], // BrightYellow
+        [0x55, 0x55, 0xff], // BrightBlue
+        [0xff, 0x55, 0xff], // BrightMagenta
+        [0x55, 0xff, 0xff], // BrightCyan
+        [0xff, 0xff, 0xff], // BrightWhite
+    ];
+    match i {
+        0..=15 => {
+            let c = BASE[i as usize];
+            Color32::from_rgb(c[0], c[1], c[2])
+        }
+        16..=231 => {
+            let i = i - 16;
+            let r = (i / 36) % 6;
+            let g = (i / 6) % 6;
+            let b = i % 6;
+            let v = |x: u8| if x == 0 { 0 } else { 55 + x * 40 };
+            Color32::from_rgb(v(r), v(g), v(b))
+        }
+        _ => {
+            let v = 8 + (i - 232) * 10;
+            Color32::from_rgb(v, v, v)
+        }
+    }
+}
+
+/// 收集终端区域内的键盘 / 粘贴事件，翻译为终端字节流。
+/// 输入法组合期间（IME preedit 非空）丢弃本帧文本事件，避免半成品拼音/候选
+/// 被当作普通输入喂给远端；提交帧的文本事件正常上屏。
+/// 返回 (字节流, 是否已复制并清除选择)。
+fn term_input_bytes(
+    ui: &egui::Ui,
+    screen: &vt100::Screen,
+    sel: Option<((u16, u16), (u16, u16))>,
+) -> (Vec<u8>, bool, bool) {
+    let events: Vec<Event> = ui.input(|i| i.events.clone());
+    let ime_active = events.iter().any(|e| {
+        matches!(
+            e,
+            Event::Ime(egui::ImeEvent::Preedit(s)) if !s.is_empty()
+        )
+    });
+    let mut out = Vec::new();
+    for ev in events {
+        match ev {
+            Event::Ime(_) => {}
+            Event::Text(t) => {
+                if !ime_active && !t.is_empty() {
+                    out.extend_from_slice(t.as_bytes());
+                }
+            }
+            Event::Key {
+                key,
+                pressed: true,
+                modifiers,
+                ..
+            } => {
+                // Ctrl+C 统一由 update 层全局捕获处理（任意焦点位置均作为中断信号），
+                // 此处不再产生字节、不拦截复制；Ctrl+Shift+C 仍复制选中文本
+                if key == Key::C && modifiers.ctrl && !modifiers.alt {
+                    if modifiers.shift {
+                        let copied = if let Some(t) = selected_text(screen, sel) {
+                            ui.ctx().copy_text(t);
+                            true
+                        } else {
+                            false
+                        };
+                        return (out, copied, false);
+                    }
+                    return (out, false, false);
+                }
+                if let Some(b) = term_key_bytes(key, modifiers, screen) {
+                    out.extend_from_slice(&b);
+                }
+            }
+            Event::Paste(text) => {
+                if screen.bracketed_paste() {
+                    out.extend_from_slice(b"\x1b[200~");
+                }
+                out.extend_from_slice(text.as_bytes());
+                if screen.bracketed_paste() {
+                    out.extend_from_slice(b"\x1b[201~");
+                }
+            }
+            _ => {}
+        }
+    }
+    (out, false, false)
+}
+
+/// 特殊按键 -> 终端字节序列（可打印字符由 Event::Text 处理，避免重复）。
+fn term_key_bytes(key: Key, mods: Modifiers, screen: &vt100::Screen) -> Option<Vec<u8>> {
+    use Key::*;
+
+    // Ctrl + 字母 / 符号（常见控制键）
+    if mods.ctrl && !mods.alt {
+        let v = key as u8 - Key::A as u8 + 1;
+        if (A..=Z).contains(&key) {
+            return Some(vec![v]);
+        }
+        match key {
+            Space => return Some(vec![0x00]),
+            OpenBracket => return Some(vec![0x1b]), // Ctrl+[ = ESC
+            Backslash => return Some(vec![0x1c]),
+            CloseBracket => return Some(vec![0x1d]),
+            Slash => return Some(vec![0x1f]),
+            _ => {}
+        }
+    }
+
+    // Alt + 字符 -> ESC + 字符
+    if mods.alt && !mods.ctrl {
+        if let Some(c) = key_char(key) {
+            let c = if mods.shift {
+                c.to_ascii_uppercase()
+            } else {
+                c
+            };
+            let mut v = vec![0x1b];
+            v.push(c as u8);
+            return Some(v);
+        }
+    }
+
+    let app_cursor = screen.application_cursor();
+    Some(match key {
+        Enter => vec![b'\r'],
+        Backspace => vec![0x7f],
+        Escape => vec![0x1b],
+        Tab => {
+            if mods.shift {
+                vec![0x1b, b'[', b'Z']
+            } else {
+                vec![b'\t']
+            }
+        }
+        ArrowUp => arrow_bytes(app_cursor, b'A'),
+        ArrowDown => arrow_bytes(app_cursor, b'B'),
+        ArrowRight => arrow_bytes(app_cursor, b'C'),
+        ArrowLeft => arrow_bytes(app_cursor, b'D'),
+        Home => arrow_bytes(app_cursor, b'H'),
+        End => arrow_bytes(app_cursor, b'F'),
+        Delete => vec![0x1b, b'[', b'3', b'~'],
+        PageUp => vec![0x1b, b'[', b'5', b'~'],
+        PageDown => vec![0x1b, b'[', b'6', b'~'],
+        Insert => vec![0x1b, b'[', b'2', b'~'],
+        F1 => vec![0x1b, b'O', b'P'],
+        F2 => vec![0x1b, b'O', b'Q'],
+        F3 => vec![0x1b, b'O', b'R'],
+        F4 => vec![0x1b, b'O', b'S'],
+        F5 => vec![0x1b, b'[', b'1', b'5', b'~'],
+        F6 => vec![0x1b, b'[', b'1', b'7', b'~'],
+        F7 => vec![0x1b, b'[', b'1', b'8', b'~'],
+        F8 => vec![0x1b, b'[', b'1', b'9', b'~'],
+        F9 => vec![0x1b, b'[', b'2', b'0', b'~'],
+        F10 => vec![0x1b, b'[', b'2', b'1', b'~'],
+        F11 => vec![0x1b, b'[', b'2', b'3', b'~'],
+        F12 => vec![0x1b, b'[', b'2', b'4', b'~'],
+        _ => return None,
+    })
+}
+
+fn arrow_bytes(app_cursor: bool, c: u8) -> Vec<u8> {
+    if app_cursor {
+        vec![0x1b, b'O', c]
+    } else {
+        vec![0x1b, b'[', c]
+    }
+}
+
+fn key_char(key: Key) -> Option<char> {
+    use Key::*;
+    // egui Key 枚举判别值按声明顺序排列且连续（A..=Z、Num0..=Num9）
+    let v = key as u8;
+    if (Key::A as u8..=Key::Z as u8).contains(&v) {
+        return Some((b'a' + (v - Key::A as u8)) as char);
+    }
+    if (Key::Num0 as u8..=Key::Num9 as u8).contains(&v) {
+        return Some((b'0' + (v - Key::Num0 as u8)) as char);
+    }
+    Some(match key {
+        Space => ' ',
+        Minus => '-',
+        Plus => '+',
+        Slash => '/',
+        Period => '.',
+        Comma => ',',
+        Semicolon => ';',
+        Quote => '\'',
+        Backslash => '\\',
+        Backtick => '`',
+        Equals => '=',
+        OpenBracket => '[',
+        CloseBracket => ']',
+        _ => return None,
+    })
+}
+
+// =====================================================================
+// 文件面板（下半部分）
+// =====================================================================
+
+/// 紧凑面板边框：缩小四周内边距，减少留白。
+fn compact_frame() -> egui::Frame {
+    egui::Frame::new().inner_margin(egui::Margin::symmetric(6, 2))
+}
+
+fn files_panel(ui: &mut egui::Ui, app: &mut SshApp) {
+    let idx = app.active_idx();
+    let connected = app.sessions.get(idx).map(|t| t.connected).unwrap_or(false);
+    // 顶部拖拽分隔条：只有手动拖动时才改变面板高度，其余时间高度固定
+    let handle_h = 5.0;
+    let (handle_rect, handle_resp) =
+        ui.allocate_exact_size(egui::vec2(ui.available_width(), handle_h), egui::Sense::drag());
+    ui.painter().rect_filled(handle_rect, 0.0, Color32::from_rgb(36, 36, 44));
+    ui.painter().rect_filled(
+        egui::Rect::from_min_max(
+            egui::pos2(handle_rect.center().x - 30.0, handle_rect.top() + 1.5),
+            egui::pos2(handle_rect.center().x + 30.0, handle_rect.bottom() - 1.5),
+        ),
+        1.5,
+        Color32::from_rgb(110, 110, 130),
+    );
+    if handle_resp.dragged() {
+        let delta = handle_resp.drag_delta().y;
+        let cur = app.files_h.unwrap_or(360.0);
+        app.files_h = Some((cur - delta).clamp(120.0, 900.0));
+    }
+    if handle_resp.hovered() || handle_resp.dragged() {
+        ui.output_mut(|o| o.cursor_icon = egui::CursorIcon::ResizeVertical);
+    }
+    ui.horizontal(|ui| {
+        ui.strong(RichText::new("远程文件").color(Color32::WHITE));
+        ui.separator();
+        if ui
+            .add_enabled(connected, egui::Button::new("⬆ 上级"))
+            .clicked()
+        {
+            if let Some(p) = parent_of(&app.sessions[idx].cwd) {
+                app.sessions[idx].user_navigated = true; // 手动打开上级，停止自动联动
+                app.navigate(p);
+            }
+        }
+        if ui
+            .add_enabled(connected, egui::Button::new("↻ 刷新"))
+            .clicked()
+        {
+            app.reload();
+        }
+        if ui
+            .add_enabled(connected, egui::Button::new("＋ 新建目录"))
+            .clicked()
+        {
+            app.dialog = Some(DialogKind::Mkdir);
+            app.dialog_input.clear();
+        }
+        if ui.add_enabled(connected, egui::Button::new("⬆ 上传")).clicked() {
+            if let Some(path) = rfd::FileDialog::new().pick_file() {
+                let dir = app.sessions[idx].cwd.clone();
+                let id = app.sessions[idx].id.clone();
+                let name = path
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| "文件".to_string());
+                app.start_transfer(true, name, false);
+                app.status_set("上传中...");
+                app.send(FsMsg::For {
+                    id,
+                    msg: FsInner::Upload {
+                        local: path,
+                        remote_dir: dir,
+                    },
+                });
+            }
+        }
+        let has_sel = app.sessions.get(idx).map(|t| t.selected.is_some()).unwrap_or(false);
+        if ui
+            .add_enabled(connected && has_sel, egui::Button::new("⬇ 下载"))
+            .clicked()
+        {
+            if let Some(remote) = app.sessions[idx].selected.clone() {
+                let id = app.sessions[idx].id.clone();
+                let default_name = remote.rsplit('/').next().unwrap_or("file").to_string();
+                let sel_is_dir = app
+                    .sessions
+                    .get(idx)
+                    .map(|t| t.entries.iter().any(|e| e.path == remote && e.is_dir))
+                    .unwrap_or(false);
+                if let Some(path) = rfd::FileDialog::new().set_file_name(&default_name).save_file() {
+                    app.start_transfer(false, default_name, sel_is_dir);
+                    app.status_set("下载中...");
+                    app.send(FsMsg::For {
+                        id,
+                        msg: FsInner::Download { remote, local: path },
+                    });
+                }
+            }
+        }
+        if ui
+            .add_enabled(connected && has_sel, egui::Button::new("✎ 重命名"))
+            .clicked()
+        {
+            if let Some(sel) = app.sessions[idx].selected.clone() {
+                app.dialog = Some(DialogKind::Rename);
+                app.dialog_old = sel.clone();
+                app.dialog_input = sel
+                    .rsplit('/')
+                    .next()
+                    .unwrap_or("")
+                    .to_string();
+            }
+        }
+        if ui
+            .add_enabled(connected && has_sel, egui::Button::new("🗑 删除"))
+            .clicked()
+        {
+            if let Some(sel) = app.sessions[idx].selected.clone() {
+                app.dialog_old = sel;
+                app.dialog = Some(DialogKind::ConfirmDelete);
+            }
+        }
+        ui.separator();
+        if ui
+            .add(egui::Button::new("✕ 关闭").small())
+            .on_hover_text("关闭文件操作区域（关闭后底部保留标签条）")
+            .clicked()
+        {
+            app.show_files = false;
+        }
+    });
+
+    ui.horizontal(|ui| {
+        ui.label(RichText::new("路径").color(Color32::WHITE));
+        if connected {
+            let resp = ui.add(
+                egui::TextEdit::singleline(&mut app.sessions[idx].cwd)
+                    .desired_width(ui.available_width()),
+            );
+            if resp.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter)) {
+                app.sessions[idx].user_navigated = true; // 手动输入路径，停止自动联动
+                let p = app.sessions[idx].cwd.clone();
+                app.navigate(p);
+            }
+        } else {
+            ui.weak("未连接");
+        }
+    });
+    ui.separator();
+
+    if !connected {
+        ui.centered_and_justified(|ui| {
+            ui.label(RichText::new("连接远程主机后，此处显示远程文件").color(Color32::GRAY).weak());
+        });
+        return;
+    }
+
+    let mut actions: Vec<FilesAction> = Vec::new();
+    // 拖放上传：从资源管理器拖入窗口任意位置放开即上传到当前目录
+    // （文件/文件夹均支持，文件夹递归上传）
+    if connected {
+        let dropped: Vec<egui::DroppedFile> = ui.input(|i| i.raw.dropped_files.clone());
+        for d in dropped {
+            if let Some(p) = d.path {
+                if p.exists() {
+                    actions.push(FilesAction::UploadLocal(p));
+                } else {
+                    app.status_set(format!("拖放路径不存在：{}", p.display()));
+                }
+            }
+        }
+        // 拖拽悬停中（指针在文件面板内）：高亮边框 + 提示（明确支持文件夹递归上传）
+        let dragging_in = ui.input(|i| !i.raw.hovered_files.is_empty());
+        if dragging_in && ui.rect_contains_pointer(ui.max_rect()) {
+            let painter = ui.painter();
+            painter.rect_stroke(
+                ui.max_rect().shrink(2.0),
+                4.0,
+                egui::Stroke::new(2.0_f32, Color32::from_rgb(80, 160, 255)),
+                egui::StrokeKind::Inside,
+            );
+            painter.text(
+                ui.max_rect().center() - egui::vec2(0.0, 24.0),
+                egui::Align2::CENTER_CENTER,
+                "松开以上传（支持文件 / 文件夹递归上传）",
+                FontId::proportional(14.0),
+                Color32::from_rgb(80, 160, 255),
+            );
+        }
+    }
+    // 表格占满剩余高度（底部留一行小字提示，不产生面板级空白）
+    let hint_h = ui.text_style_height(&egui::TextStyle::Small) + 4.0;
+    egui::ScrollArea::vertical()
+        .auto_shrink([false, false])
+        .max_height((ui.available_height() - hint_h).max(40.0))
+        .show(ui, |ui| {
+            TableBuilder::new(ui)
+                .vscroll(false) // 关闭表格内部滚动，统一由外层 ScrollArea 提供垂直滚动条
+                .striped(true)
+                .sense(egui::Sense::click()) // 整行可交互：任意列右键都弹出菜单
+                .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
+                .column(Column::auto().at_least(220.0))
+                .column(Column::initial(110.0).at_least(70.0))
+                .column(Column::initial(150.0))
+                .column(Column::remainder())
+                .header(22.0, |mut h| {
+                    h.col(|ui| {
+                        ui.strong(RichText::new("名称").color(Color32::WHITE));
+                    });
+                    h.col(|ui| {
+                        ui.strong(RichText::new("大小").color(Color32::WHITE));
+                    });
+                    h.col(|ui| {
+                        ui.strong(RichText::new("修改时间").color(Color32::WHITE));
+                    });
+                    h.col(|ui| {
+                        ui.strong(RichText::new("权限").color(Color32::WHITE));
+                    });
+                })
+                .body(|mut body| {
+                    for entry in &app.sessions[idx].entries {
+                        let path = entry.path.clone();
+                        let is_dir = entry.is_dir;
+                        body.row(20.0, |mut row| {
+                            let selected =
+                                app.sessions[idx].selected.as_deref() == Some(path.as_str());
+                            let (r1, _) = row.col(|ui| {
+                                let color = if is_dir {
+                                    Color32::from_rgb(120, 180, 255)
+                                } else if selected {
+                                    Color32::from_rgb(210, 228, 255)
+                                } else {
+                                    ui.visuals().text_color()
+                                };
+                                // 矢量图标（替代 emoji，黑色主题下更清晰美观）
+                                let (icon_rect, _) =
+                                    ui.allocate_exact_size(egui::vec2(15.0, 13.0), egui::Sense::hover());
+                                paint_file_icon(
+                                    ui.painter(),
+                                    icon_rect,
+                                    is_dir,
+                                    entry.is_symlink,
+                                    selected,
+                                    false,
+                                );
+                                let hr = ui.horizontal(|ui| {
+                                    ui.label(RichText::new(&entry.name).color(color));
+                                });
+                                // 整行（图标+文本）可点击/双击（右键菜单在行级统一处理）
+                                let resp = ui.interact(
+                                    hr.response.rect,
+                                    ui.id().with(&path),
+                                    egui::Sense::click(),
+                                );
+                                if resp.double_clicked() && is_dir {
+                                    actions.push(FilesAction::Navigate(path.clone()));
+                                } else if resp.clicked() {
+                                    if is_dir {
+                                        actions.push(FilesAction::Navigate(path.clone()));
+                                    } else {
+                                        actions.push(FilesAction::Select(path.clone()));
+                                    }
+                                }
+                            });
+                            let (r2, _) = row.col(|ui| {
+                                if is_dir {
+                                    ui.weak("—");
+                                } else {
+                                    ui.label(entry.size.map(fmt_size).unwrap_or_else(|| "—".into()));
+                                }
+                            });
+                            let (r3, _) = row.col(|ui| {
+                                ui.weak(entry.mtime.clone().unwrap_or_default());
+                            });
+                            row.col(|ui| {
+                                ui.weak(entry.perms.clone().unwrap_or_default());
+                                // 整行 hover / 选中高亮：前三列 rect union + 当前权限列区域 = 整行
+                                let row_full = r1.union(r2).union(r3).union(ui.max_rect());
+                                let hovered = ui.rect_contains_pointer(row_full);
+                                if hovered || selected {
+                                    let bg = if selected {
+                                        Color32::from_rgba_unmultiplied(58, 88, 138, 120)
+                                    } else {
+                                        Color32::from_rgba_unmultiplied(82, 122, 182, 55)
+                                    };
+                                    ui.painter().rect_filled(row_full, 2.0, bg);
+                                }
+                                if hovered {
+                                    ui.output_mut(|o| o.cursor_icon = egui::CursorIcon::PointingHand);
+                                }
+                            });
+                            // 整行右键菜单：删除 / 下载（文件与文件夹均支持，文件夹递归处理）
+                            let menu_path = path.clone();
+                            let menu_is_dir = is_dir;
+                            row.response().context_menu(|ui| {
+                                if ui.button("⬇ 下载").clicked() {
+                                    actions.push(FilesAction::DownloadSel(menu_path.clone()));
+                                    ui.close_menu();
+                                }
+                                if ui
+                                    .button(RichText::new("🗑 删除").color(Color32::LIGHT_RED))
+                                    .clicked()
+                                {
+                                    app.dialog_old = menu_path.clone();
+                                    app.dialog = Some(DialogKind::ConfirmDelete);
+                                    ui.close_menu();
+                                }
+                                if menu_is_dir && ui.button("进入目录").clicked() {
+                                    actions.push(FilesAction::Navigate(menu_path));
+                                    ui.close_menu();
+                                }
+                            });
+                        });
+                    }
+                });
+        });
+    for a in actions {
+        match a {
+            FilesAction::Navigate(p) => {
+                app.sessions[idx].user_navigated = true; // 双击进入目录，停止自动联动
+                app.navigate(p);
+            }
+            FilesAction::Select(p) => app.sessions[idx].selected = Some(p),
+            // 拖放上传：文件/文件夹均自动识别，上传到当前目录
+            FilesAction::UploadLocal(p) => {
+                if app.sessions[idx].connected {
+                    let dir = app.sessions[idx].cwd.clone();
+                    let id = app.sessions[idx].id.clone();
+                    let name = p
+                        .file_name()
+                        .map(|n| n.to_string_lossy().into_owned())
+                        .unwrap_or_else(|| "文件".to_string());
+                    app.start_transfer(true, name, p.is_dir());
+                    app.status_set("上传中...");
+                    app.send(FsMsg::For {
+                        id,
+                        msg: FsInner::Upload {
+                            local: p,
+                            remote_dir: dir,
+                        },
+                    });
+                }
+            }
+            // 右键下载：文件走保存对话框，文件夹走目录选择（递归下载）
+            FilesAction::DownloadSel(p) => {
+                if !app.sessions[idx].connected {
+                    continue;
+                }
+                let is_dir = app
+                    .sessions
+                    .get(idx)
+                    .map(|t| t.entries.iter().any(|e| e.path == p && e.is_dir))
+                    .unwrap_or(false);
+                let default_name = p.rsplit('/').next().unwrap_or("file").to_string();
+                if is_dir {
+                    if let Some(dir) = rfd::FileDialog::new().pick_folder() {
+                        let id = app.sessions[idx].id.clone();
+                        app.start_transfer(false, default_name, true);
+                        app.status_set("下载中...");
+                        app.send(FsMsg::For {
+                            id,
+                            msg: FsInner::Download { remote: p, local: dir },
+                        });
+                    }
+                } else if let Some(path) = rfd::FileDialog::new()
+                    .set_file_name(&default_name)
+                    .save_file()
+                {
+                    let id = app.sessions[idx].id.clone();
+                    app.start_transfer(false, default_name, false);
+                    app.status_set("下载中...");
+                    app.send(FsMsg::For {
+                        id,
+                        msg: FsInner::Download { remote: p, local: path },
+                    });
+                }
+            }
+        }
+    }
+    ui.weak("提示：终端区域点击后可输入命令（支持 vim / top / htop 等全屏程序）；文件区域单击目录进入、双击文件选中，顶部按钮可上传 / 下载 / 新建 / 删除 / 重命名。");
+}
+
+enum FilesAction {
+    Navigate(String),
+    Select(String),
+    UploadLocal(PathBuf),
+    DownloadSel(String),
+}
+
+// =====================================================================
+// 后台线程：消息驱动的 tokio 运行时 + SSH/SFTP
+// =====================================================================
+
+/// 发往远程 shell 通道的命令（经 mpsc 队列由读循环任务独占执行）
+enum ShellCmd {
+    Data(Vec<u8>),
+    SigInt,
+}
+
+struct SessionCtx {
+    id: String,
+    writer: tokio::sync::mpsc::UnboundedSender<ShellCmd>,
+    _read_task: tokio::task::JoinHandle<()>,
+}
+
+fn spawn_backend(rx: Receiver<FsMsg>, tx: Sender<BackMsg>) {
+    std::thread::spawn(move || {
+        let rt = match tokio::runtime::Runtime::new() {
+            Ok(r) => r,
+            Err(e) => {
+                let _ = tx.send(BackMsg::Log(format!("启动异步运行时失败：{e}")));
+                return;
+            }
+        };
+        let ssh = std::sync::Arc::new(ssh::SshManager::new());
+        use std::collections::HashMap;
+        let mut sessions: HashMap<String, SessionCtx> = HashMap::new();
+
+        while let Ok(msg) = rx.recv() {
+            match msg {
+                FsMsg::Connect(req) => {
+                    // 允许多个连接同时打开：每个请求建立独立会话
+                    let ssh2 = ssh.clone();
+                    let tx2 = tx.clone();
+                    let mut opened: Option<(
+                        String,
+                        tokio::sync::mpsc::UnboundedSender<ShellCmd>,
+                        tokio::task::JoinHandle<()>,
+                    )> = None;
+                    rt.block_on(async {
+                        match ssh2
+                            .connect(req.host, req.port, req.user, req.password, req.key_path)
+                            .await
+                        {
+                            Err(e) => {
+                                let _ = tx2.send(BackMsg::Connected(Err((req.token, e))));
+                            }
+                            Ok(id) => {
+                                let _ = tx2.send(BackMsg::Connected(Ok((req.token, id.clone()))));
+                                // 打开交互式 shell
+                                match ssh2.open_shell(&id, 80, 24).await {
+                                    Err(e) => {
+                                        let _ = tx2.send(BackMsg::Log(format!("启动交互终端失败：{e}")));
+                                    }
+                                    Ok(channel) => {
+                                        let tx3 = tx2.clone();
+                                        let id3 = id.clone();
+                                        // 写请求队列；读循环任务独占 channel（锁），同时处理读写与信号
+                                        let (wtx, mut wrx) =
+                                            tokio::sync::mpsc::unbounded_channel::<ShellCmd>();
+                                        let ch = std::sync::Arc::new(tokio::sync::Mutex::new(channel));
+                                        let ch_read = ch.clone();
+                                        let read_task = rt.spawn(async move {
+                                            use tokio::io::AsyncReadExt;
+                                            use tokio::io::AsyncWriteExt;
+                                            let mut buf = vec![0u8; 16384];
+                                            loop {
+                                                tokio::select! {
+                                                    r = async {
+                                                        let mut g = ch_read.lock().await;
+                                                        let mut reader = g.make_reader();
+                                                        reader.read(&mut buf).await
+                                                    } => {
+                                                        match r {
+                                                            Ok(0) | Err(_) => break,
+                                                            Ok(n) => {
+                                                                if tx3
+                                                                    .send(BackMsg::For {
+                                                                        id: id3.clone(),
+                                                                        msg: BackInner::ShellData(
+                                                                            buf[..n].to_vec(),
+                                                                        ),
+                                                                    })
+                                                                    .is_err()
+                                                                {
+                                                                    break;
+                                                                }
+                                                            }
+                                                        }
+                                                    }
+                                                    cmd = wrx.recv() => {
+                                                        match cmd {
+                                                            Some(ShellCmd::Data(b)) => {
+                                                                let g = ch.lock().await;
+                                                                let mut w = g.make_writer();
+                                                                if w.write_all(&b).await.is_err() {
+                                                                    break;
+                                                                }
+                                                            }
+                                                            Some(ShellCmd::SigInt) => {
+                                                                let g = ch.lock().await;
+                                                                let mut w = g.make_writer();
+                                                                // 0x03（PTY 中断字符，ISIG 下即 SIGINT 给前台进程组）；
+                                                                // 连发三次抗丢（数据通道此刻可能仍有积压输出）
+                                                                let _ = w.write_all(&[0x03]).await;
+                                                                let _ = w.write_all(&[0x03]).await;
+                                                                let _ = w.write_all(&[0x03]).await;
+                                                                drop(w);
+                                                                // SSH signal INT 走控制平面（辅助通道，连发两次防 sshd 忽略）
+                                                                let _ = g.signal(russh::Sig::INT).await;
+                                                                let _ = g.signal(russh::Sig::INT).await;
+                                                            }
+                                                            None => break,
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                            let _ = tx3.send(BackMsg::For {
+                                                id: id3,
+                                                msg: BackInner::ShellClosed,
+                                            });
+                                        });
+                                        opened = Some((id, wtx, read_task));
+                                    }
+                                }
+                            }
+                        }
+                    });
+                    if let Some((id, writer, read_task)) = opened {
+                        sessions.insert(
+                            id.clone(),
+                            SessionCtx {
+                                id,
+                                writer,
+                                _read_task: read_task,
+                            },
+                        );
+                    }
+                }
+                FsMsg::For { id, msg } => match msg {
+                    FsInner::CancelTransfer { up } => {
+                        // 置对应方向取消标志；正在传输的循环检测后中止
+                        ssh::cancel_transfer(&ssh, up);
+                    }
+                    FsInner::Disconnect => {
+                        if let Some(s) = sessions.remove(&id) {
+                            let ssh2 = ssh.clone();
+                            rt.block_on(async move {
+                                let _ = ssh2.disconnect(&s.id).await;
+                            });
+                        }
+                        let _ = tx.send(BackMsg::For {
+                            id,
+                            msg: BackInner::Disconnected,
+                        });
+                    }
+                    FsInner::List(path) => {
+                        if let Some(s) = sessions.get(&id) {
+                            let ssh2 = ssh.clone();
+                            let id2 = s.id.clone();
+                            let tx2 = tx.clone();
+                            rt.block_on(async move {
+                                let r = ssh2.list(&id2, &path).await;
+                                let _ = tx2.send(BackMsg::For {
+                                    id: id2,
+                                    msg: BackInner::List(r),
+                                });
+                            });
+                        }
+                    }
+                    FsInner::Mkdir(p) => {
+                        if let Some(s) = sessions.get(&id) {
+                            let ssh2 = ssh.clone();
+                            let id2 = s.id.clone();
+                            let tx2 = tx.clone();
+                            rt.block_on(async move {
+                                let r = ssh2.mkdir(&id2, &p).await;
+                                let _ = tx2.send(BackMsg::For {
+                                    id: id2,
+                                    msg: BackInner::Mkdir(r),
+                                });
+                            });
+                        }
+                    }
+                    FsInner::Remove(p) => {
+                        if let Some(s) = sessions.get(&id) {
+                            let ssh2 = ssh.clone();
+                            let id2 = s.id.clone();
+                            let tx2 = tx.clone();
+                            rt.block_on(async move {
+                                // 递归删除：文件直接删，目录先清空子项再删自身
+                                let r = ssh2.remove_entry(&id2, &p).await;
+                                let _ = tx2.send(BackMsg::For {
+                                    id: id2,
+                                    msg: BackInner::Remove(r),
+                                });
+                            });
+                        }
+                    }
+                    FsInner::Rename(old, newp) => {
+                        if let Some(s) = sessions.get(&id) {
+                            let ssh2 = ssh.clone();
+                            let id2 = s.id.clone();
+                            let tx2 = tx.clone();
+                            rt.block_on(async move {
+                                let r = ssh2.rename(&id2, &old, &newp).await;
+                                let _ = tx2.send(BackMsg::For {
+                                    id: id2,
+                                    msg: BackInner::Rename(r),
+                                });
+                            });
+                        }
+                    }
+                    FsInner::Upload { local, remote_dir } => {
+                        if let Some(s) = sessions.get(&id) {
+                            let ssh2 = ssh.clone();
+                            let id2 = s.id.clone();
+                            let tx2 = tx.clone();
+                            let local2 = local.clone();
+                            let dir = remote_dir.clone();
+                            // 异步任务执行传输：不阻塞消息循环，取消消息可被及时处理
+                            rt.spawn(async move {
+                                // 自动识别本地是文件还是目录：文件直接上传，目录递归上传
+                                // 进度回调：实时上报 (已传字节, 文件总字节) 供明细面板进度条
+                                let _ = tx2.send(BackMsg::TransferStart { up: true });
+                                let txp = tx2.clone();
+                                let cb = move |done: u64, total: u64| {
+                                    let _ = txp.send(BackMsg::Progress {
+                                        up: true,
+                                        done,
+                                        total,
+                                    });
+                                };
+                                let r = ssh2.upload_entry(&id2, &local2, &dir, &cb).await;
+                                ssh::reset_cancel(&ssh2, true);
+                                let _ = tx2.send(BackMsg::For {
+                                    id: id2,
+                                    msg: BackInner::Upload(r),
+                                });
+                            });
+                        }
+                    }
+                    FsInner::Download { remote, local } => {
+                        if let Some(s) = sessions.get(&id) {
+                            let ssh2 = ssh.clone();
+                            let id2 = s.id.clone();
+                            let tx2 = tx.clone();
+                            let local2 = local.clone();
+                            let remote2 = remote.clone();
+                            // 异步任务执行传输：不阻塞消息循环，取消消息可被及时处理
+                            rt.spawn(async move {
+                                // 自动识别远端是文件还是目录：文件直接下载，目录递归下载
+                                // 进度回调：实时上报 (已传字节, 文件总字节) 供明细面板进度条
+                                let _ = tx2.send(BackMsg::TransferStart { up: false });
+                                let txp = tx2.clone();
+                                let cb = move |done: u64, total: u64| {
+                                    let _ = txp.send(BackMsg::Progress {
+                                        up: false,
+                                        done,
+                                        total,
+                                    });
+                                };
+                                let r = ssh2.download_entry(&id2, &remote2, &local2, &cb).await;
+                                ssh::reset_cancel(&ssh2, false);
+                                let _ = tx2.send(BackMsg::For {
+                                    id: id2,
+                                    msg: BackInner::Download(r),
+                                });
+                            });
+                        }
+                    }
+                    FsInner::SysInfo => {
+                        if let Some(s) = sessions.get(&id) {
+                            let ssh2 = ssh.clone();
+                            let id2 = s.id.clone();
+                            let tx2 = tx.clone();
+                            rt.block_on(async move {
+                                let r = ssh2.sysinfo(&id2).await;
+                                let _ = tx2.send(BackMsg::For {
+                                    id: id2,
+                                    msg: BackInner::SysInfo(r),
+                                });
+                            });
+                        }
+                    }
+                    FsInner::Ping => {
+                        if let Some(s) = sessions.get(&id) {
+                            let ssh2 = ssh.clone();
+                            let id2 = s.id.clone();
+                            let tx2 = tx.clone();
+                            rt.block_on(async move {
+                                let r = ssh2.ping(&id2).await;
+                                let _ = tx2.send(BackMsg::For {
+                                    id: id2,
+                                    msg: BackInner::Ping(r),
+                                });
+                            });
+                        }
+                    }
+                    FsInner::ShellInput(bytes) => {
+                        if let Some(s) = sessions.get(&id) {
+                            let _ = s.writer.send(ShellCmd::Data(bytes));
+                        }
+                    }
+                    FsInner::SigInt => {
+                        if let Some(s) = sessions.get(&id) {
+                            let _ = s.writer.send(ShellCmd::SigInt);
+                        }
+                    }
+                },
+            }
+        }
+    });
+}
+
+// =====================================================================
+// 工具函数
+// =====================================================================
+
+fn parent_of(path: &str) -> Option<String> {
+    let p = path.trim_end_matches('/');
+    if p.is_empty() {
+        return None;
+    }
+    let idx = p.rfind('/')?;
+    if idx == 0 {
+        Some("/".into())
+    } else {
+        Some(p[..idx].to_string())
+    }
+}
+
+fn join_path(dir: &str, name: &str) -> String {
+    if dir == "/" {
+        format!("/{}", name.trim_start_matches('/'))
+    } else {
+        format!("{}/{}", dir.trim_end_matches('/'), name.trim_start_matches('/'))
+    }
+}
+
+fn fmt_size(n: u64) -> String {
+    // 大小从字节起算：单位 B / KB / MB / GB / TB（1024 进制）
+    const K: f64 = 1024.0;
+    if n < K as u64 {
+        return format!("{} B", n);
+    }
+    let units = ["KB", "MB", "GB", "TB"];
+    let mut v = n as f64;
+    let mut u = 0; // 除以 1024 的次数；u=1 -> KB, u=2 -> MB, u=3 -> GB, u=4 -> TB
+    while v >= K && u < units.len() {
+        v /= K;
+        u += 1;
+    }
+    format!("{:.1} {}", v, units[u - 1])
+}
+
+// =====================================================================
+// 本地账号存储（exe 同目录 accounts.tsv，tab 分隔）
+// =====================================================================
+
+/// 一条已保存的远程账号。
+#[derive(Clone)]
+struct SavedAccount {
+    name: String,
+    host: String,
+    port: u16,
+    user: String,
+    password: Option<String>,
+    key: Option<String>,
+}
+
+/// 账号文件路径：exe 同目录 accounts.tsv。
+fn accounts_path() -> PathBuf {
+    std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(|d| d.to_path_buf()))
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join("accounts.tsv")
+}
+
+/// 序列化为 TSV 文本（字段：name\thost\tport\tuser\tpassword\tkey）。
+fn serialize_accounts(accounts: &[SavedAccount]) -> String {
+    let mut s = String::new();
+    for a in accounts {
+        s.push_str(&a.name);
+        s.push('\t');
+        s.push_str(&a.host);
+        s.push('\t');
+        s.push_str(&a.port.to_string());
+        s.push('\t');
+        s.push_str(&a.user);
+        s.push('\t');
+        s.push_str(a.password.as_deref().unwrap_or(""));
+        s.push('\t');
+        s.push_str(a.key.as_deref().unwrap_or(""));
+        s.push('\n');
+    }
+    s
+}
+
+/// 解析 TSV 文本为账号列表（跳过损坏行）。
+fn parse_accounts(text: &str) -> Vec<SavedAccount> {
+    let mut out = Vec::new();
+    for line in text.lines() {
+        let mut f = line.split('\t');
+        let name = match f.next() {
+            Some(n) => n.to_string(),
+            None => continue,
+        };
+        let host = match f.next() {
+            Some(h) => h.to_string(),
+            None => continue,
+        };
+        let port: u16 = match f.next() {
+            Some(p) => match p.parse() {
+                Ok(v) => v,
+                Err(_) => continue,
+            },
+            None => continue,
+        };
+        let user = match f.next() {
+            Some(u) => u.to_string(),
+            None => continue,
+        };
+        if host.is_empty() || user.is_empty() {
+            continue;
+        }
+        let password = f.next().map(|s| s.to_string()).filter(|s| !s.is_empty());
+        let key = f.next().map(|s| s.to_string()).filter(|s| !s.is_empty());
+        out.push(SavedAccount {
+            name: if name.is_empty() {
+                format!("{user}@{host}")
+            } else {
+                name
+            },
+            host,
+            port,
+            user,
+            password,
+            key,
+        });
+    }
+    out
+}
+
+fn load_accounts() -> Vec<SavedAccount> {
+    match std::fs::read_to_string(accounts_path()) {
+        Ok(text) => parse_accounts(&text),
+        Err(_) => Vec::new(),
+    }
+}
+
+fn save_accounts(accounts: &[SavedAccount]) {
+    let _ = std::fs::write(accounts_path(), serialize_accounts(accounts));
+}
+
+/// 以 host+port+user 为主键去重插入/覆盖。
+fn upsert_account(accounts: &mut Vec<SavedAccount>, acc: SavedAccount) {
+    if let Some(i) = accounts
+        .iter()
+        .position(|a| a.host == acc.host && a.port == acc.port && a.user == acc.user)
+    {
+        accounts[i] = acc;
+    } else {
+        accounts.push(acc);
+    }
+}
+
+// =====================================================================
+
+/// 从 ICO 字节中提取面积最大的 PNG 块（窗口图标使用）。
+fn ico_largest_png(ico: &[u8]) -> Option<&[u8]> {
+    if ico.len() < 6 {
+        return None;
+    }
+    let count = u16::from_le_bytes([ico[4], ico[5]]) as usize;
+    let mut best: Option<(u32, usize, usize)> = None; // (area, offset, size)
+    for i in 0..count {
+        let e = 6 + i * 16;
+        if ico.len() < e + 16 {
+            break;
+        }
+        let w = ico[e] as u32;
+        let h = ico[e + 1] as u32;
+        let size = u32::from_le_bytes([ico[e + 8], ico[e + 9], ico[e + 10], ico[e + 11]]) as usize;
+        let off = u32::from_le_bytes([ico[e + 12], ico[e + 13], ico[e + 14], ico[e + 15]]) as usize;
+        if ico.len() < off + size {
+            continue;
+        }
+        let d = &ico[off..off + size];
+        if d.starts_with(b"\x89PNG\r\n\x1a\n") {
+            let w = if w == 0 { 256 } else { w };
+            let h = if h == 0 { 256 } else { h };
+            if best.as_ref().map_or(true, |(a, _, _)| w * h > *a) {
+                best = Some((w * h, off, size));
+            }
+        }
+    }
+    best.map(|(_, off, size)| &ico[off..off + size])
+}
+
+fn main() -> eframe::Result<()> {
+    // 崩溃诊断：任何 panic 都写入 exe 同目录 crash.log 并弹窗提示位置，
+    // 便于在输入法提交等场景下直接定位崩溃行。
+    std::panic::set_hook(Box::new(|info| {
+        let where_ = std::env::current_exe()
+            .ok()
+            .and_then(|p| p.parent().map(|d| d.join("crash.log")))
+            .unwrap_or_else(|| std::path::PathBuf::from("crash.log"));
+        let _ = std::fs::write(
+            &where_,
+            format!(
+                "panic: {info}\n\n{}\n",
+                std::backtrace::Backtrace::force_capture()
+            ),
+        );
+        let msg = format!(
+            "程序发生内部错误，即将退出。\n\n{info}\n\n崩溃详情已写入：\n{}",
+            where_.display()
+        );
+        // Windows 下弹出错误对话框提示崩溃位置；macOS/Linux 仅写 crash.log
+        #[cfg(target_os = "windows")]
+        {
+            unsafe {
+                let wide: Vec<u16> = msg
+                    .encode_utf16()
+                    .chain(std::iter::once(0))
+                    .collect();
+                let cap: Vec<u16> = "SSH 远程终端 - 错误"
+                    .encode_utf16()
+                    .chain(std::iter::once(0))
+                    .collect();
+                extern "system" {
+                    fn MessageBoxW(
+                        hwnd: *const std::ffi::c_void,
+                        text: *const u16,
+                        caption: *const u16,
+                        u_type: u32,
+                    ) -> i32;
+                }
+                MessageBoxW(std::ptr::null_mut(), wide.as_ptr(), cap.as_ptr(), 0x10);
+            }
+        }
+    }));
+
+    tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::WARN)
+        .init();
+
+    // 窗口图标：从打包的 app.ico 中取出最大 PNG 尺寸作为窗口/任务栏图标
+    let app_icon = ico_largest_png(include_bytes!("../packaging/app.ico"))
+        .and_then(|png| eframe::icon_data::from_png_bytes(png).ok());
+    let options = eframe::NativeOptions {
+        // 渲染后端固定为 glow(OpenGL)。无独显/远程桌面环境下，
+        // 将 Mesa3D(llvmpipe) 的 opengl32.dll 放置于 exe 同目录即可软件渲染。
+        // 注意：不要改回 wgpu —— 无独显时 wgpu 回退到 d3d10warp.dll(WARP)，
+        // 输入法提交时会触发 WARP 栈溢出崩溃（BEX64 / c0000409）。
+        renderer: eframe::Renderer::Glow,
+        viewport: egui::ViewportBuilder::default()
+            .with_inner_size([1150.0, 780.0])
+            .with_min_inner_size([820.0, 560.0])
+            .with_drag_and_drop(true) // 支持从资源管理器拖放文件/文件夹上传
+            .with_title("3F-Shell")
+            .with_icon(app_icon.unwrap_or_default()), // 窗口/任务栏图标（来自 app.ico）
+        ..Default::default()
+    };
+
+    // 系统级键盘钩子 + 全局热键（Ctrl+C 必达通道）：仅在 Windows 启用
+    #[cfg(target_os = "windows")]
+    {
+        let _ = kbhook::start();
+    }
+
+    let result = eframe::run_native(
+        "sky-remote-assistance",
+        options,
+        Box::new(|cc| Ok(Box::new(SshApp::new(cc)))),
+    );
+    // 事件循环以 Err 返回（初始化失败等）时不会触发 panic hook，这里补记日志
+    if let Err(e) = &result {
+        let where_ = std::env::current_exe()
+            .ok()
+            .and_then(|p| p.parent().map(|d| d.join("crash.log")))
+            .unwrap_or_else(|| std::path::PathBuf::from("crash.log"));
+        let _ = std::fs::write(&where_, format!("eframe 事件循环返回错误：{e:?}"));
+        result
+    } else {
+        // 窗口正常关闭后立即退出进程：连接打开时后台线程可能阻塞在
+        // SSH 网络 IO（russh 无超时）的 block_on 中，若等它自然退出
+        // 会造成关闭卡顿/进程残留，直接强退保证窗口秒关。
+        #[cfg(target_os = "windows")]
+        kbhook::stop();
+        std::process::exit(0);
+    }
+}
+
+// =====================================================================
+// 单元测试：终端 <-> 文件面板联动的路径解析逻辑
+// =====================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cd_line_parsing() {
+        // 绝对路径
+        assert_eq!(parse_cd_line("cd /var/log", &None, "root"), Some(String::from("/var/log")));
+        // 多命令截断（&& / ; / |）
+        assert_eq!(parse_cd_line("cd /var/log && ls", &None, "root"), Some(String::from("/var/log")));
+        assert_eq!(parse_cd_line("cd /tmp; pwd", &None, "root"), Some(String::from("/tmp")));
+        // 无参数 -> home
+        assert_eq!(parse_cd_line("cd", &None, "root"), Some(String::from("/root")));
+        assert_eq!(parse_cd_line("cd", &None, "alice"), Some(String::from("/home/alice")));
+        // ~ 展开
+        assert_eq!(parse_cd_line("cd ~", &Some(String::from("/root")), "root"), Some(String::from("/root")));
+        assert_eq!(parse_cd_line("cd ~/a/b", &None, "alice"), Some(String::from("/home/alice/a/b")));
+        // 相对路径 + ..
+        assert_eq!(parse_cd_line("cd ..", &Some(String::from("/var/log")), "root"), Some(String::from("/var")));
+        assert_eq!(parse_cd_line("cd ./x", &Some(String::from("/var")), "root"), Some(String::from("/var/x")));
+        assert_eq!(parse_cd_line("cd x", &Some(String::from("/var")), "root"), Some(String::from("/var/x")));
+        // 根目录
+        assert_eq!(parse_cd_line("cd /", &None, "root"), Some(String::from("/")));
+        // 不支持 / 忽略
+        assert_eq!(parse_cd_line("cd -", &Some(String::from("/a")), "root"), None);
+        assert_eq!(parse_cd_line("ls", &None, "root"), None);
+        assert_eq!(parse_cd_line("cdrom", &None, "root"), None);
+        assert_eq!(parse_cd_line("", &None, "root"), None);
+    }
+
+    #[test]
+    fn normalize_paths() {
+        assert_eq!(normalize_path("/a/b", "../c", "root"), String::from("/a/c"));
+        assert_eq!(normalize_path("/", "x", "root"), String::from("/x"));
+        assert_eq!(normalize_path("/a", "/b/../c", "root"), String::from("/c"));
+        assert_eq!(normalize_path("/a", ".", "root"), String::from("/a"));
+        assert_eq!(normalize_path("/a/b/", "", "root"), String::from("/a/b"));
+        assert_eq!(normalize_path("/a/b/c", "../../x", "root"), String::from("/a/x"));
+    }
+
+    #[test]
+    fn metric_pct_parsing() {
+        // CPU：使用率 35.2%
+        assert_eq!(
+            metric_pct("使用率 35.2% / 空闲 64.8%"),
+            Some(35.2)
+        );
+        // 内存 / 硬盘：括号内百分数
+        assert_eq!(metric_pct("已用 1023M / 共 15.1G（7%）"), Some(7.0));
+        assert_eq!(metric_pct("/ 已用 8.2G / 共 40G（22%）"), Some(22.0));
+        // 半角括号也兼容
+        assert_eq!(metric_pct("/ 已用 1.2G / 共 30G(4%)"), Some(4.0));
+        // 异常数据回退
+        assert_eq!(metric_pct("(no data)"), None);
+        assert_eq!(metric_pct(""), None);
+    }
+
+    #[test]
+    fn prompt_path_parsing() {
+        // Debian/Ubuntu bash 默认提示符
+        assert_eq!(parse_prompt_path("root@host:/var/log#"), Some(String::from("/var/log")));
+        assert_eq!(parse_prompt_path("user@host:~$"), Some(String::from("~")));
+        assert_eq!(parse_prompt_path("user@host:/srv/www $"), Some(String::from("/srv/www")));
+        // 简单 PS1
+        assert_eq!(parse_prompt_path("/root#"), Some(String::from("/root")));
+        assert_eq!(parse_prompt_path("~$"), Some(String::from("~")));
+        assert_eq!(parse_prompt_path("/home/user>"), Some(String::from("/home/user")));
+        // 不支持的格式（安全跳过）
+        assert_eq!(parse_prompt_path("user@host /x %"), None); // zsh 空格分隔
+        assert_eq!(parse_prompt_path("hello world"), None);
+        assert_eq!(parse_prompt_path(""), None);
+        assert_eq!(parse_prompt_path("top - 12:00:00 up 1 day"), None);
+        assert_eq!(parse_prompt_path("\"file.txt\" 12L, 45C"), None);
+    }
+
+    #[test]
+    fn account_serialize_roundtrip() {
+        let accounts = vec![
+            SavedAccount {
+                name: "root@10.0.0.5".into(),
+                host: "10.0.0.5".into(),
+                port: 22,
+                user: "root".into(),
+                password: Some("secret".into()),
+                key: None,
+            },
+            SavedAccount {
+                name: "dev@example.com".into(),
+                host: "example.com".into(),
+                port: 2222,
+                user: "dev".into(),
+                password: None,
+                key: Some("C:\\keys\\id_ed25519".into()),
+            },
+        ];
+        let text = serialize_accounts(&accounts);
+        let parsed = parse_accounts(&text);
+        assert_eq!(parsed.len(), 2);
+        assert_eq!(parsed[0].host, "10.0.0.5");
+        assert_eq!(parsed[0].port, 22);
+        assert_eq!(parsed[0].password.as_deref(), Some("secret"));
+        assert_eq!(parsed[1].port, 2222);
+        assert_eq!(parsed[1].key.as_deref(), Some("C:\\keys\\id_ed25519"));
+        assert_eq!(parsed[1].password, None);
+    }
+
+    #[test]
+    fn account_parse_bad_lines() {
+        // 损坏行（端口非法 / 用户为空）跳过；host+user 完整但 name 为空时自动补名
+        let text = "root@h\t10.0.0.5\t22\troot\tpwd\t\n\tbad-no-host\t22\tuser\t\t\nx\ty\tnotaport\tu\t\t\nz\th2\t22\t\t\t\nok\th3\t22\tu3\t\t\n";
+        let parsed = parse_accounts(text);
+        assert_eq!(parsed.len(), 3);
+        assert_eq!(parsed[0].host, "10.0.0.5");
+        assert_eq!(parsed[1].name, "user@bad-no-host"); // name 空 -> 自动生成
+        assert_eq!(parsed[2].name, "ok");
+        assert_eq!(parsed[2].host, "h3");
+    }
+
+    #[test]
+    fn account_upsert_dedupe() {
+        let mut accounts = Vec::new();
+        upsert_account(
+            &mut accounts,
+            SavedAccount { name: "a@h".into(), host: "h".into(), port: 22, user: "a".into(), password: Some("p1".into()), key: None },
+        );
+        upsert_account(
+            &mut accounts,
+            SavedAccount { name: "b@h".into(), host: "h".into(), port: 22, user: "b".into(), password: None, key: None },
+        );
+        assert_eq!(accounts.len(), 2);
+        // 同 host+port+user 覆盖
+        upsert_account(
+            &mut accounts,
+            SavedAccount { name: "a@h".into(), host: "h".into(), port: 22, user: "a".into(), password: Some("p2".into()), key: None },
+        );
+        assert_eq!(accounts.len(), 2);
+        assert_eq!(accounts[0].password.as_deref(), Some("p2"));
+    }
+
+    #[test]
+    fn transfer_persist_roundtrip() {
+        // 持久化往返：写入 -> 读回一致；进行中记录不保留；字段内 tab/换行被净化
+        let path = std::env::temp_dir().join(format!("tlog_test_{}.tsv", std::process::id()));
+        let log = vec![
+            TransferRec { time: "10:01:02".into(), up: true, name: "a.txt".into(), size: Some(1024), ok: true, detail: "完成".into() },
+            TransferRec { time: "10:01:03".into(), up: false, name: "dir b".into(), size: None, ok: false, detail: "进行中...".into() },
+            TransferRec { time: "10:01:04".into(), up: false, name: "x\ty\nz".into(), size: Some(0), ok: true, detail: "完成".into() },
+        ];
+        persist_transfers_to(&path, &log);
+        let loaded = load_transfers_from(&path);
+        let _ = std::fs::remove_file(&path);
+        // 进行中记录被过滤
+        assert_eq!(loaded.len(), 2);
+        assert_eq!(loaded[0].up, true);
+        assert_eq!(loaded[0].name, "a.txt");
+        assert_eq!(loaded[0].size, Some(1024));
+        assert_eq!(loaded[0].ok, true);
+        assert_eq!(loaded[0].detail, "完成");
+        // 字段内 tab / 换行被替换为空格
+        assert_eq!(loaded[1].name, "x y z");
+    }
+
+    #[test]
+    fn fmt_size_units() {
+        // 单位索引防回归：除 2 次 1024 是 MB（units[u-1]），不是 GB
+        assert_eq!(fmt_size(500), "500 B");
+        assert_eq!(fmt_size(1024), "1.0 KB");
+        assert_eq!(fmt_size(11151 * 1024), "10.9 MB"); // 11151 KB 的文件
+        assert_eq!(fmt_size(1024 * 1024), "1.0 MB");
+        assert_eq!(fmt_size(1024 * 1024 * 1024), "1.0 GB");
+        assert_eq!(fmt_size(1024u64.pow(4)), "1.0 TB");
+    }
+
+    #[test]
+    fn tab_completion_basic() {
+        fn mk(name: &str, is_dir: bool) -> ssh::FileEntry {
+            ssh::FileEntry {
+                name: name.into(),
+                path: String::new(),
+                is_dir,
+                is_symlink: false,
+                size: None,
+                perms: None,
+                mtime: None,
+            }
+        }
+        let entries = vec![
+            mk("hello.txt", false),
+            mk("hello_dir", true),
+            mk("world.rs", false),
+        ];
+        // 单个匹配 -> 补全文件名
+        let (out, new) = build_tab_completion(&entries, "cat hello.tx").unwrap();
+        assert_eq!(new, "cat hello.txt");
+        assert_eq!(out[0], 0x08); // 退格开头
+        // 目录 -> 末尾加 /
+        let (_, new) = build_tab_completion(&entries, "cd hello_d").unwrap();
+        assert_eq!(new, "cd hello_dir/");
+        // 多个匹配 -> 最长公共前缀
+        let (_, new) = build_tab_completion(&entries, "ls he").unwrap();
+        assert_eq!(new, "ls hello");
+        // 无匹配 -> None
+        assert!(build_tab_completion(&entries, "ls zzz").is_none());
+        // 绝对路径 / 子目录路径 -> None（交给远端 shell）
+        assert!(build_tab_completion(&entries, "ls /var/x").is_none());
+        assert!(build_tab_completion(&entries, "ls sub/dir").is_none());
+        // 空行 -> None
+        assert!(build_tab_completion(&entries, "").is_none());
+    }
+}

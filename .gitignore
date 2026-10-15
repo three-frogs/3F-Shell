@@ -1,0 +1,14 @@
+# 构建产物
+/target/
+
+# 安装包产物（可由 ISCC 重新生成）
+/dist/
+
+# 第三方软件渲染 DLL（681MB，构建/打包时手动复制到 target\release）
+/mesa_x64/
+
+# 运行时用户数据（含账号密码，切勿提交）
+accounts.tsv
+transfers.log
+crash.log
+*.log

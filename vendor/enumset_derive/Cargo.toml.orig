@@ -1,0 +1,25 @@
+[package]
+name = "enumset_derive"
+version = "0.4.4"
+authors = ["Lymia Aluysia <lymia@lymiahugs.com>"]
+edition = "2018"
+
+description = "An internal helper crate for enumset. Not public API."
+
+documentation = "https://lymia.moe/doc/enumset/enumset/"
+repository = "https://github.com/Lymia/enumset"
+
+license = "MIT/Apache-2.0"
+
+[lib]
+proc-macro = true
+
+[features]
+nightly = ["proc-macro2/nightly", "darling/diagnostics"]
+serde = []
+
+[dependencies]
+darling = "0.10.0"
+syn = "1"
+quote = "1"
+proc-macro2 = "1"

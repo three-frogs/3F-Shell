@@ -1,0 +1,14 @@
+# 使用国内镜像加速依赖下载
+[source.crates-io]
+replace-with = "rsproxy-sparse"
+
+[source.rsproxy-sparse]
+registry = "sparse+https://rsproxy.cn/index/"
+
+[net]
+git-fetch-with-cli = true
+
+# 使用 rust-lld 作为链接器（gnullvm 工具链自带，无需安装 Visual Studio / MinGW）
+[target.x86_64-pc-windows-gnullvm]
+linker = "rust-lld"
+

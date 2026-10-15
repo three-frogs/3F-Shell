@@ -1,0 +1,54 @@
+[package]
+name = "sky-remote-assistance"
+version = "0.2.0"
+edition = "2021"
+build = "build.rs"
+description = "Windows 下对 Linux 的远程 SSH 登录与文件系统可视化操作（桌面 GUI）"
+license = "MIT"
+
+[dependencies]
+# GUI
+# 渲染后端：强制 glow(OpenGL) + Mesa3D(llvmpipe) 软件渲染。
+# 之前用 wgpu feature：无独显时回退到 d3d10warp.dll(WARP)，输入法提交时 WARP 内部栈溢出崩溃（BEX64 / c0000409）。
+# 因此移除 wgpu，改回历轮验证可用的 glow 后端。
+eframe = { version = "0.31", features = ["glow"] }
+egui = "0.31"
+egui_extras = "0.31"
+# 终端模拟（VT100 解析，纯 Rust）
+vt100 = "0.6"
+# 异步运行时 + SSH
+tokio = { version = "1", features = ["full"] }
+russh = "0.46"
+russh-sftp = "2"
+async-trait = "0.1"
+# 工具
+uuid = { version = "1", features = ["v4"] }
+chrono = "0.4"
+tracing = "0.1"
+tracing-subscriber = "0.3"
+
+# 原生文件对话框（平台后端：Windows=win32、Linux=xdg-portal、macOS=macos）
+[target.'cfg(target_os = "windows")'.dependencies]
+rfd = { version = "0.15", default-features = false }
+# 系统级键盘钩子（WH_KEYBOARD_LL）：绕过输入法(IME)拦截，可靠捕获 Ctrl+C
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Threading",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_WindowsAndMessaging",
+] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+rfd = { version = "0.15", default-features = false, features = ["gtk3"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+rfd = { version = "0.15", default-features = false }
+
+[profile.release]
+opt-level = 2
+
+# enumset_derive 0.4.4 使用了 syn 1.x 早期移除的 `syn::export` 模块，
+# 本地 vendor 并修复为 proc_macro2::Span（两者等价），保证在最新 syn 下可编译。
+[patch.crates-io]
+enumset_derive = { path = "vendor/enumset_derive" }
