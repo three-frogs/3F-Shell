@@ -516,50 +516,71 @@ fn persist_transfers_to(path: &std::path::Path, log: &[TransferRec]) {
 
 impl SshApp {
     fn new(cc: &eframe::CreationContext<'_>) -> Self {
-        // egui 默认字体不含 CJK，加载系统中文字体作为回退，避免中文显示为方块；
-        // 同时从 exe 同目录加载 emoji 图标字体（内置 emoji-icon-font 副本，带纵向微调），
-        // 保证 ⚙ 等按钮图标正常显示且位置居中（egui 无法渲染彩色位图 emoji 字体）。
-        for path in ["C:\\Windows\\Fonts\\simhei.ttf", "C:\\Windows\\Fonts\\msyh.ttc"] {
+        // egui 默认字体不含 CJK，按平台加载系统中文字体作为回退，避免中文显示为方块；
+        // 同时从 exe 同目录加载 emoji 图标字体（icon_font，带纵向微调），
+        // 保证 ⬆/↻/🗑/📂 等按钮图标在 Windows / macOS / Linux 上统一渲染、位置居中
+        // （egui 无法渲染彩色位图 emoji 字体，需用内置 emoji-icon-font 副本兜底）。
+        let mut fonts = egui::FontDefinitions::default();
+
+        // (a) CJK 中文字体：按平台候选路径，首个存在者生效
+        let cjk_candidates: &[&str] = if cfg!(target_os = "macos") {
+            &[
+                "/System/Library/Fonts/PingFang.ttc",
+                "/System/Library/Fonts/STHeiti Light.ttc",
+                "/System/Library/Fonts/Hiragino Sans GB.ttc",
+            ]
+        } else if cfg!(target_os = "linux") {
+            &[
+                "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+                "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.otf",
+                "/usr/share/fonts/truetype/wqy/wqy-microhei.ttc",
+                "/usr/share/fonts/truetype/droid/DroidSansFallbackFull.ttf",
+            ]
+        } else {
+            &["C:\\Windows\\Fonts\\simhei.ttf", "C:\\Windows\\Fonts\\msyh.ttc"]
+        };
+        let mut cjk_loaded = false;
+        for path in cjk_candidates {
             if let Ok(bytes) = std::fs::read(path) {
-                let mut fonts = egui::FontDefinitions::default();
                 fonts.font_data.insert(
                     "cjk".to_owned(),
                     std::sync::Arc::new(egui::FontData::from_owned(bytes)),
                 );
-                // 用带 tweak 的图标字体副本替换默认 emoji-icon-font（⚙ 等字形下移居中）
-                if let Ok(exe) = std::env::current_exe() {
-                    if let Some(dir) = exe.parent() {
-                        let p = dir.join("emoji-icon-font.ttf");
-                        if let Ok(icon_bytes) = std::fs::read(&p) {
-                            let mut icon_data = egui::FontData::from_owned(icon_bytes);
-                            icon_data.tweak.y_offset = 2.0; // 图标整体下移一点
-                            fonts.font_data.insert(
-                                "icon_font".to_owned(),
-                                std::sync::Arc::new(icon_data),
-                            );
-                            for family in
-                                [egui::FontFamily::Proportional, egui::FontFamily::Monospace]
-                            {
-                                if let Some(list) = fonts.families.get_mut(&family) {
-                                    list.retain(|n| n != "emoji-icon-font");
-                                    list.push("cjk".to_owned());
-                                    list.push("icon_font".to_owned());
-                                }
-                            }
-                            cc.egui_ctx.set_fonts(fonts);
-                            break;
-                        }
-                    }
-                }
-                for family in [egui::FontFamily::Proportional, egui::FontFamily::Monospace] {
-                    if let Some(list) = fonts.families.get_mut(&family) {
-                        list.push("cjk".to_owned());
-                    }
-                }
-                cc.egui_ctx.set_fonts(fonts);
+                cjk_loaded = true;
                 break;
             }
         }
+
+        // (b) 图标字体：独立加载，不依赖 CJK 是否命中（macOS / Linux 同样生效）
+        let mut icon_loaded = false;
+        if let Ok(exe) = std::env::current_exe() {
+            if let Some(dir) = exe.parent() {
+                let p = dir.join("emoji-icon-font.ttf");
+                if let Ok(icon_bytes) = std::fs::read(&p) {
+                    let mut icon_data = egui::FontData::from_owned(icon_bytes);
+                    icon_data.tweak.y_offset = 2.0; // 图标整体下移一点
+                    fonts.font_data.insert(
+                        "icon_font".to_owned(),
+                        std::sync::Arc::new(icon_data),
+                    );
+                    icon_loaded = true;
+                }
+            }
+        }
+
+        // 把 cjk / icon_font 挂到两个字族末尾（默认字形优先命中，中文与图标回退到自定义字体）
+        for family in [egui::FontFamily::Proportional, egui::FontFamily::Monospace] {
+            if let Some(list) = fonts.families.get_mut(&family) {
+                list.retain(|n| n != "emoji-icon-font");
+                if cjk_loaded {
+                    list.push("cjk".to_owned());
+                }
+                if icon_loaded {
+                    list.push("icon_font".to_owned());
+                }
+            }
+        }
+        cc.egui_ctx.set_fonts(fonts);
 
         // 全局紧凑样式：缩小间距与控件留白，让终端/文件区域更紧凑
         let mut style = (*cc.egui_ctx.style()).clone();
@@ -1423,7 +1444,7 @@ fn tab_bar(ui: &mut egui::Ui, app: &mut SshApp) {
             let mut widths: Vec<f32> = Vec::with_capacity(n);
             for i in 0..n {
                 let t = &app.sessions[i];
-                let label_full = format!("{}（{}）", t.account.name, t.account.host);
+                let label_full = format!("{} ({})", t.account.name, t.account.host);
                 let w_full = ui
                     .fonts(|f| f.layout_no_wrap(label_full, font_id.clone(), Color32::WHITE))
                     .size()
@@ -1473,7 +1494,7 @@ fn tab_bar(ui: &mut egui::Ui, app: &mut SshApp) {
                     dot_c,
                 );
                 // 标签文本（宽度减半后按可用宽度截断，避免溢出到相邻标签）
-                let label_full = format!("{}（{}）", t.account.name, t.account.host);
+                let label_full = format!("{} ({})", t.account.name, t.account.host);
                 let w_full = ui
                     .fonts(|f| f.layout_no_wrap(label_full.clone(), font_id.clone(), Color32::WHITE))
                     .size()
@@ -1626,7 +1647,7 @@ fn left_panel(ui: &mut egui::Ui, app: &mut SshApp) {
     if connected {
         if let Some((name, host, port)) = name_text {
             ui.strong(
-                RichText::new(format!("{name}（{host}:{port}）"))
+                RichText::new(format!("{name} ({host}:{port})"))
                     .size(14.0)
                     .color(Color32::WHITE),
             );

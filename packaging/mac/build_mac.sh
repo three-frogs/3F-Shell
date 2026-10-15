@@ -31,6 +31,8 @@ echo "==> [2/5] 组装 $APP.app"
 rm -rf "$STAGE"
 mkdir -p "$APPDIR/Contents/MacOS" "$APPDIR/Contents/Resources"
 cp "$ROOT/target/release/sky-remote-assistance" "$APPDIR/Contents/MacOS/$APP"
+# 图标字体与主程序同目录（main.rs 按 exe 同目录加载 emoji-icon-font.ttf 作为按钮图标字体）
+cp "$ROOT/emoji-icon-font.ttf" "$APPDIR/Contents/MacOS/emoji-icon-font.ttf"
 
 # 从 1024 源图生成 AppIcon.icns（sips + iconutil）
 if [ -f "$ROOT/packaging/icon-1024.png" ]; then

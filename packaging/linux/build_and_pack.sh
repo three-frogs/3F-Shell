@@ -24,6 +24,10 @@ cp $BIN /root/pkg/3f-shell_${VER}_amd64/usr/bin/3f-shell
 if [ -f packaging/icon-256.png ]; then
   cp packaging/icon-256.png /root/pkg/3f-shell_${VER}_amd64/usr/share/icons/hicolor/256x256/apps/3f-shell.png
 fi
+# 图标字体与主程序同目录（main.rs 按 exe 同目录加载 emoji-icon-font.ttf 作为按钮图标字体）
+if [ -f emoji-icon-font.ttf ]; then
+  cp emoji-icon-font.ttf /root/pkg/3f-shell_${VER}_amd64/usr/bin/
+fi
 
 cat > /root/pkg/3f-shell_${VER}_amd64/DEBIAN/control <<'CTRL'
 Package: 3f-shell
@@ -56,6 +60,9 @@ mkdir -p /root/pkg/3f-shell
 cp $BIN /root/pkg/3f-shell/3f-shell
 if [ -f packaging/icon-256.png ]; then
   cp packaging/icon-256.png /root/pkg/3f-shell/
+fi
+if [ -f emoji-icon-font.ttf ]; then
+  cp emoji-icon-font.ttf /root/pkg/3f-shell/
 fi
 cd /root/pkg
 tar -czf 3f-shell-linux-x86_64-${VER}.tar.gz 3f-shell
