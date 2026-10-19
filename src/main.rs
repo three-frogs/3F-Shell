@@ -2354,26 +2354,47 @@ fn transfer_panel_content(ui: &mut egui::Ui, app: &mut SshApp) {
                 } else {
                     ("⬇", Color32::from_rgb(20, 110, 50))
                 };
-                let status_icon = if r.ok { "✓" } else { "✗" };
                 let status_color = if r.ok {
                     Color32::from_rgb(20, 120, 60)
                 } else {
                     Color32::from_rgb(190, 40, 40)
                 };
                 let size_txt = r.size.map(fmt_size).unwrap_or_else(|| "—".to_string());
+                // 对齐设计稿：条目一行 = 方向 + 图标 + 文件名 + 右侧状态（百分比 / 已完成）
                 ui.horizontal(|ui| {
                     ui.label(RichText::new(arrow).color(color));
                     // 文件/文件夹矢量图标区分显示（与文件区域风格一致，浅底深色版）
                     let (icon_rect, _) =
                         ui.allocate_exact_size(egui::vec2(15.0, 13.0), egui::Sense::hover());
                     paint_file_icon(ui.painter(), icon_rect, r.is_dir, false, false, true);
-                    // 文件名按面板宽度截断，避免长文件名把右侧状态列挤出可视区
-                    ui.label(RichText::new(truncate_wide(&r.name, 18)).color(black));
+                    // 文件名固定宽度截断（剩余宽度留给右侧状态，避免换行/重叠）
+                    let name = truncate_wide(&r.name, 14);
+                    let name_resp = ui.add_sized(
+                        [150.0, 16.0],
+                        egui::Label::new(RichText::new(name).color(black)).truncate(),
+                    );
+                    name_resp.on_hover_text(format!(
+                        "{}\n{} · {}",
+                        r.name,
+                        size_txt,
+                        if r.time.is_empty() { "—" } else { &r.time }
+                    ));
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        ui.label(RichText::new(status_icon).color(status_color));
-                        ui.label(RichText::new(&r.time).color(gray));
-                        ui.label(RichText::new(size_txt).color(gray));
-                        ui.label(RichText::new(&r.detail).color(gray));
+                        // 状态：进行中显示实时百分比，完成显示「✓ 已完成」，其余按记录状态
+                        let status_txt = if r.ok {
+                            format!("✓ 已完成")
+                        } else if r.detail == "进行中..." {
+                            match r.progress {
+                                Some((done, total)) if total > 0 => format!(
+                                    "{:.0}%",
+                                    done.min(total) as f32 * 100.0 / total as f32
+                                ),
+                                _ => "进行中...".to_string(),
+                            }
+                        } else {
+                            r.detail.clone()
+                        };
+                        ui.label(RichText::new(status_txt).color(status_color));
                     });
                 });
                 // 进行中：实时进度条（已传 / 总字节）
@@ -3755,14 +3776,19 @@ fn render_remote_table(
                     for entry in &app.sessions[idx].entries {
                         let path = entry.path.clone();
                         let is_dir = entry.is_dir;
-                        body.row(20.0, |mut row| {
+                        body.row(22.0, |mut row| {
                             let selected =
                                 app.sessions[idx].selected.as_deref() == Some(path.as_str());
                             let (r1, _) = row.col(|ui| {
+                                // hover 联动：指针位于名称列区域时名称文字变蓝（设计稿浅蓝 hover 风格）
+                                let cell_rect = ui.max_rect();
+                                let hovered_cell = ui.rect_contains_pointer(cell_rect) && !selected;
                                 let color = if is_dir {
                                     Color32::from_rgb(29, 78, 216)
                                 } else if selected {
                                     Color32::from_rgb(30, 64, 175)
+                                } else if hovered_cell {
+                                    Color32::from_rgb(37, 99, 235)
                                 } else {
                                     ui.visuals().text_color()
                                 };
@@ -3814,15 +3840,16 @@ fn render_remote_table(
                             row.col(|ui| {
                                 ui.weak(entry.perms.clone().unwrap_or_default());
                                 // 整行 hover / 选中高亮：前三列 rect union + 当前权限列区域 = 整行
-                                let row_full = r1.union(r2).union(r3).union(ui.max_rect());
+                                let cell_rect = ui.max_rect();
+                                let row_full = r1.union(r2).union(r3).union(cell_rect);
                                 let hovered = ui.rect_contains_pointer(row_full);
                                 if hovered || selected {
                                     let bg = if selected {
-                                        Color32::from_rgba_unmultiplied(191, 219, 254, 200)
+                                        Color32::from_rgba_unmultiplied(191, 219, 254, 220)
                                     } else {
-                                        Color32::from_rgba_unmultiplied(219, 234, 254, 120)
+                                        Color32::from_rgba_unmultiplied(219, 234, 254, 160)
                                     };
-                                    ui.painter().rect_filled(row_full, 2.0, bg);
+                                    ui.painter().rect_filled(row_full, 4.0, bg);
                                 }
                                 if hovered {
                                     ui.output_mut(|o| o.cursor_icon = egui::CursorIcon::PointingHand);
@@ -3913,10 +3940,17 @@ fn render_local_table(ui: &mut egui::Ui, app: &mut SshApp, avail_h: f32) {
                         let path = e.path.clone();
                         let is_dir = e.is_dir;
                         let selected = app.local_selected.as_deref() == Some(path.as_str());
-                        body.row(20.0, |mut row| {
+                        body.row(22.0, |mut row| {
                             let (r1, _) = row.col(|ui| {
+                                // hover 联动：名称列区域 hover 时文字变蓝（设计稿浅蓝 hover 风格）
+                                let cell_rect = ui.max_rect();
+                                let hovered_cell = ui.rect_contains_pointer(cell_rect) && !selected;
                                 let color = if is_dir {
                                     Color32::from_rgb(29, 78, 216)
+                                } else if selected {
+                                    Color32::from_rgb(30, 64, 175)
+                                } else if hovered_cell {
+                                    Color32::from_rgb(37, 99, 235)
                                 } else {
                                     ui.visuals().text_color()
                                 };
@@ -3948,15 +3982,16 @@ fn render_local_table(ui: &mut egui::Ui, app: &mut SshApp, avail_h: f32) {
                             });
                             row.col(|ui| {
                                 ui.weak(&e.mtime);
-                                let row_full = r1.union(r2).union(ui.max_rect());
+                                let cell_rect = ui.max_rect();
+                                let row_full = r1.union(r2).union(cell_rect);
                                 let hovered = ui.rect_contains_pointer(row_full);
                                 if hovered || selected {
                                     let bg = if selected {
-                                        Color32::from_rgba_unmultiplied(191, 219, 254, 200)
+                                        Color32::from_rgba_unmultiplied(191, 219, 254, 220)
                                     } else {
-                                        Color32::from_rgba_unmultiplied(219, 234, 254, 120)
+                                        Color32::from_rgba_unmultiplied(219, 234, 254, 160)
                                     };
-                                    ui.painter().rect_filled(row_full, 2.0, bg);
+                                    ui.painter().rect_filled(row_full, 4.0, bg);
                                 }
                             });
                         });
