@@ -1323,9 +1323,9 @@ impl eframe::App for SshApp {
         ctx.request_repaint_after(std::time::Duration::from_secs(1));
 
         // 左侧栏：已存账号 + 状态 + 远端系统信息（连接/断开全部在左侧操作）
+        // 固定宽度 240px：不随内容/文本长度缩放，也不允许拖拽
         egui::SidePanel::left("left_panel")
-            .resizable(true)
-            .default_width(210.0)
+            .exact_width(240.0)
             .frame(
                 egui::Frame::new()
                     .fill(Color32::from_rgb(242, 244, 247))
