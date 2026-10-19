@@ -2382,21 +2382,47 @@ fn transfer_panel_content(ui: &mut egui::Ui, app: &mut SshApp) {
                         if r.time.is_empty() { "—" } else { &r.time }
                     ));
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        // 状态：进行中显示实时百分比，完成显示「✓ 已完成」，其余按记录状态
-                        let status_txt = if r.ok {
-                            format!("✓ 已完成")
-                        } else if r.detail == "进行中..." {
-                            match r.progress {
-                                Some((done, total)) if total > 0 => format!(
-                                    "{:.0}%",
-                                    done.min(total) as f32 * 100.0 / total as f32
-                                ),
-                                _ => "进行中...".to_string(),
-                            }
+                        // 状态：进行中显示实时百分比，完成显示「已完成 + 自绘绿色对勾图标」
+                        // （✓ U+2713 不在任何已加载字体字族中，用 painter 矢量绘制保证跨平台渲染）
+                        if r.ok {
+                            let (rect, _) =
+                                ui.allocate_exact_size(egui::vec2(16.0, 16.0), egui::Sense::hover());
+                            let c = rect.center();
+                            let painter = ui.painter();
+                            painter.circle_filled(
+                                egui::pos2(c.x, c.y),
+                                7.0,
+                                Color32::from_rgb(34, 197, 94),
+                            );
+                            painter.line_segment(
+                                [
+                                    egui::pos2(c.x - 3.4, c.y),
+                                    egui::pos2(c.x - 0.8, c.y + 2.6),
+                                ],
+                                egui::Stroke::new(1.8_f32, Color32::WHITE),
+                            );
+                            painter.line_segment(
+                                [
+                                    egui::pos2(c.x - 0.8, c.y + 2.6),
+                                    egui::pos2(c.x + 3.6, c.y - 2.6),
+                                ],
+                                egui::Stroke::new(1.8_f32, Color32::WHITE),
+                            );
+                            ui.label(RichText::new("已完成").color(status_color));
                         } else {
-                            r.detail.clone()
-                        };
-                        ui.label(RichText::new(status_txt).color(status_color));
+                            let status_txt = if r.detail == "进行中..." {
+                                match r.progress {
+                                    Some((done, total)) if total > 0 => format!(
+                                        "{:.0}%",
+                                        done.min(total) as f32 * 100.0 / total as f32
+                                    ),
+                                    _ => "进行中...".to_string(),
+                                }
+                            } else {
+                                r.detail.clone()
+                            };
+                            ui.label(RichText::new(status_txt).color(status_color));
+                        }
                     });
                 });
                 // 进行中：实时进度条（已传 / 总字节）
