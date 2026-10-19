@@ -2350,9 +2350,10 @@ fn transfer_panel_content(ui: &mut egui::Ui, app: &mut SshApp) {
         .show(ui, |ui| {
             for r in &app.transfer_log {
                 let (arrow, color) = if r.up {
-                    ("⬆", Color32::from_rgb(30, 80, 160))
+                    // 用内置字体箭头（emoji ⬆/⬇ 在部分平台默认字体缺失不渲染）
+                    ("↑", Color32::from_rgb(30, 80, 160))
                 } else {
-                    ("⬇", Color32::from_rgb(20, 110, 50))
+                    ("↓", Color32::from_rgb(20, 110, 50))
                 };
                 let status_color = if r.ok {
                     Color32::from_rgb(20, 120, 60)
@@ -2368,9 +2369,9 @@ fn transfer_panel_content(ui: &mut egui::Ui, app: &mut SshApp) {
                         ui.allocate_exact_size(egui::vec2(15.0, 13.0), egui::Sense::hover());
                     paint_file_icon(ui.painter(), icon_rect, r.is_dir, false, false, true);
                     // 文件名固定宽度截断（剩余宽度留给右侧状态，避免换行/重叠）
-                    let name = truncate_wide(&r.name, 14);
+                    let name = truncate_wide(&r.name, 12);
                     let name_resp = ui.add_sized(
-                        [150.0, 16.0],
+                        [115.0, 16.0],
                         egui::Label::new(RichText::new(name).color(black)).truncate(),
                     );
                     name_resp.on_hover_text(format!(
@@ -3818,26 +3819,68 @@ fn render_remote_table(
                                 }
                             });
                             let (r2, _) = row.col(|ui| {
+                                // hover 联动：大小列文字变蓝
+                                let cell_rect = ui.max_rect();
+                                let hovered_cell = ui.rect_contains_pointer(cell_rect) && !selected;
+                                let hover_color = Color32::from_rgb(37, 99, 235);
+                                let normal_color = Color32::from_rgb(107, 114, 128);
                                 if is_dir {
-                                    ui.weak("—");
+                                    ui.label(
+                                        RichText::new("—").color(if hovered_cell {
+                                            hover_color
+                                        } else {
+                                            normal_color
+                                        }),
+                                    );
                                 } else {
-                                    ui.label(entry.size.map(fmt_size).unwrap_or_else(|| "—".into()));
+                                    ui.label(
+                                        RichText::new(
+                                            entry
+                                                .size
+                                                .map(fmt_size)
+                                                .unwrap_or_else(|| "—".into()),
+                                        )
+                                        .color(if hovered_cell {
+                                            hover_color
+                                        } else {
+                                            normal_color
+                                        }),
+                                    );
                                 }
                             });
                             let (r3, _) = row.col(|ui| {
-                                ui.weak(entry.mtime.clone().unwrap_or_default());
+                                // hover 联动：修改时间列文字变蓝
+                                let cell_rect = ui.max_rect();
+                                let hovered_cell = ui.rect_contains_pointer(cell_rect) && !selected;
+                                let txt = entry.mtime.clone().unwrap_or_default();
+                                ui.label(
+                                    RichText::new(txt).color(if hovered_cell {
+                                        Color32::from_rgb(37, 99, 235)
+                                    } else {
+                                        Color32::from_rgb(107, 114, 128)
+                                    }),
+                                );
                             });
                             row.col(|ui| {
-                                ui.weak(entry.perms.clone().unwrap_or_default());
-                                // 整行 hover / 选中高亮：前三列 rect union + 当前权限列区域 = 整行
+                                // hover 联动：权限列文字变蓝
                                 let cell_rect = ui.max_rect();
+                                let hovered_cell = ui.rect_contains_pointer(cell_rect) && !selected;
+                                let perms = entry.perms.clone().unwrap_or_default();
+                                ui.label(
+                                    RichText::new(perms).color(if hovered_cell {
+                                        Color32::from_rgb(37, 99, 235)
+                                    } else {
+                                        Color32::from_rgb(107, 114, 128)
+                                    }),
+                                );
+                                // 整行 hover / 选中高亮：前三列 rect union + 当前权限列区域 = 整行
                                 let row_full = r1.union(r2).union(r3).union(cell_rect);
                                 let hovered = ui.rect_contains_pointer(row_full);
                                 if hovered || selected {
                                     let bg = if selected {
                                         Color32::from_rgba_unmultiplied(191, 219, 254, 220)
                                     } else {
-                                        Color32::from_rgba_unmultiplied(219, 234, 254, 160)
+                                        Color32::from_rgba_unmultiplied(219, 234, 254, 185)
                                     };
                                     ui.painter().rect_filled(row_full, 4.0, bg);
                                 }
@@ -3964,22 +4007,45 @@ fn render_local_table(ui: &mut egui::Ui, app: &mut SshApp, avail_h: f32) {
                                 }
                             });
                             let (r2, _) = row.col(|ui| {
+                                // hover 联动：大小列文字变蓝
+                                let cell_rect = ui.max_rect();
+                                let hovered_cell = ui.rect_contains_pointer(cell_rect) && !selected;
+                                let hover_color = Color32::from_rgb(37, 99, 235);
+                                let normal_color = Color32::from_rgb(107, 114, 128);
                                 if is_dir {
-                                    ui.weak("—");
+                                    ui.label(RichText::new("—").color(if hovered_cell {
+                                        hover_color
+                                    } else {
+                                        normal_color
+                                    }));
                                 } else {
-                                    ui.label(fmt_size(e.size));
+                                    ui.label(
+                                        RichText::new(fmt_size(e.size)).color(if hovered_cell {
+                                            hover_color
+                                        } else {
+                                            normal_color
+                                        }),
+                                    );
                                 }
                             });
                             row.col(|ui| {
-                                ui.weak(&e.mtime);
+                                // hover 联动：修改时间列文字变蓝
                                 let cell_rect = ui.max_rect();
+                                let hovered_cell = ui.rect_contains_pointer(cell_rect) && !selected;
+                                ui.label(
+                                    RichText::new(&e.mtime).color(if hovered_cell {
+                                        Color32::from_rgb(37, 99, 235)
+                                    } else {
+                                        Color32::from_rgb(107, 114, 128)
+                                    }),
+                                );
                                 let row_full = r1.union(r2).union(cell_rect);
                                 let hovered = ui.rect_contains_pointer(row_full);
                                 if hovered || selected {
                                     let bg = if selected {
                                         Color32::from_rgba_unmultiplied(191, 219, 254, 220)
                                     } else {
-                                        Color32::from_rgba_unmultiplied(219, 234, 254, 160)
+                                        Color32::from_rgba_unmultiplied(219, 234, 254, 185)
                                     };
                                     ui.painter().rect_filled(row_full, 4.0, bg);
                                 }
