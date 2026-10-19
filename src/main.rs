@@ -1959,11 +1959,11 @@ fn left_panel(ui: &mut egui::Ui, app: &mut SshApp) {
                 }
                 let gname = if g.is_empty() { "未分组" } else { g.as_str() };
                 if g.is_empty() {
-                    ui.weak(RichText::new(format!("▸ {gname}")).small());
+                    ui.weak(RichText::new(format!("› {gname}")).small());
                 } else {
                     // 命名分组：右侧提供「重命名 / 删除」维护入口
                     ui.horizontal(|ui| {
-                        ui.weak(RichText::new(format!("▸ {gname}")).small());
+                        ui.weak(RichText::new(format!("› {gname}")).small());
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                             if ui
                                 .small_button("×")
