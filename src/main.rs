@@ -3329,15 +3329,20 @@ fn files_panel(ui: &mut egui::Ui, app: &mut SshApp) {
     }
     ui.horizontal(|ui| {
         ui.strong(RichText::new("远程文件").color(Color32::from_rgb(31, 41, 55)));
-        let cwd_show = app
-            .sessions
-            .get(idx)
-            .map(|t| t.cwd.clone())
-            .unwrap_or_default();
-        ui.label(
-            RichText::new(format!("  {}", truncate_wide(&cwd_show, 30)))
-                .color(Color32::from_rgb(107, 114, 128)),
-        );
+        // 路径输入框并入标题行（唯一路径展示处，可编辑，回车导航；对齐设计稿「远程文件 /var/www/html」一体式）
+        if connected {
+            let resp = ui.add(
+                egui::TextEdit::singleline(&mut app.sessions[idx].cwd)
+                    .desired_width((ui.available_width() - 250.0).max(120.0)),
+            );
+            if resp.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter)) {
+                app.sessions[idx].user_navigated = true; // 手动输入路径，停止自动联动
+                let p = app.sessions[idx].cwd.clone();
+                app.navigate(p);
+            }
+        } else {
+            ui.weak("未连接");
+        }
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             // 传输队列开关：带任务计数（对齐设计稿「传输队列 N 个任务」）
             let n = app.transfer_log.len();
@@ -3466,21 +3471,6 @@ fn files_panel(ui: &mut egui::Ui, app: &mut SshApp) {
             .clicked()
         {
             app.show_files = false;
-        }
-        ui.separator();
-        ui.label("路径");
-        if connected {
-            let resp = ui.add(
-                egui::TextEdit::singleline(&mut app.sessions[idx].cwd)
-                    .desired_width(ui.available_width() - 4.0),
-            );
-            if resp.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter)) {
-                app.sessions[idx].user_navigated = true; // 手动输入路径，停止自动联动
-                let p = app.sessions[idx].cwd.clone();
-                app.navigate(p);
-            }
-        } else {
-            ui.weak("未连接");
         }
     });
     ui.separator();
