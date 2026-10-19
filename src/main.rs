@@ -3329,64 +3329,10 @@ fn files_panel(ui: &mut egui::Ui, app: &mut SshApp) {
     if handle_resp.hovered() || handle_resp.dragged() {
         ui.output_mut(|o| o.cursor_icon = egui::CursorIcon::ResizeVertical);
     }
+    // 文件区顶部单行：远程文件 + 基础操作 | 分隔线 | 路径 …… 右侧：传输队列开关 / 上传 / 关闭
     ui.horizontal(|ui| {
         ui.strong(RichText::new("远程文件").color(Color32::from_rgb(31, 41, 55)));
-        // 路径输入框并入标题行（唯一路径展示处，可编辑，回车导航；对齐设计稿「远程文件 /var/www/html」一体式）
-        if connected {
-            let resp = ui.add(
-                egui::TextEdit::singleline(&mut app.sessions[idx].cwd)
-                    .desired_width((ui.available_width() - 250.0).max(120.0)),
-            );
-            if resp.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter)) {
-                app.sessions[idx].user_navigated = true; // 手动输入路径，停止自动联动
-                let p = app.sessions[idx].cwd.clone();
-                app.navigate(p);
-            }
-        } else {
-            ui.weak("未连接");
-        }
-        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            // 传输队列开关：带任务计数（对齐设计稿「传输队列 N 个任务」）
-            let n = app.transfer_log.len();
-            if ui
-                .add(egui::Button::new(format!("📋 传输队列 {n} 个任务")).small())
-                .on_hover_text("显示 / 隐藏右侧传输队列（高度跟随文件区域）")
-                .clicked()
-            {
-                app.show_transfer = !app.show_transfer;
-            }
-            // 上传主按钮（设计稿主视觉：蓝底白字「上传」）
-            if ui
-                .add_enabled(
-                    connected,
-                    egui::Button::new(RichText::new("上传").color(Color32::WHITE))
-                        .fill(Color32::from_rgb(59, 130, 246)),
-                )
-                .clicked()
-            {
-                if let Some(path) = rfd::FileDialog::new().pick_file() {
-                    let dir = app.sessions[idx].cwd.clone();
-                    let id = app.sessions[idx].id.clone();
-                    let name = path
-                        .file_name()
-                        .map(|n| n.to_string_lossy().into_owned())
-                        .unwrap_or_else(|| "文件".to_string());
-                    app.start_transfer(true, name, false);
-                    app.status_set("上传中...");
-                    app.send(FsMsg::For {
-                        id,
-                        msg: FsInner::Upload {
-                            local: path,
-                            remote_dir: dir,
-                        },
-                    });
-                }
-            }
-        });
-    });
-
-    // 工具行：文件操作按钮 + 路径输入框（上传 / 队列开关已移至标题行）
-    ui.horizontal(|ui| {
+        // 基础操作
         if ui
             .add_enabled(connected, egui::Button::new("↑ 上级"))
             .clicked()
@@ -3456,24 +3402,66 @@ fn files_panel(ui: &mut egui::Ui, app: &mut SshApp) {
             }
         }
         ui.separator();
-        let dual_btn = if app.show_dual { "‖ 单栏" } else { "‖ 双栏" };
-        if ui
-            .add(egui::Button::new(dual_btn).small())
-            .on_hover_text("双栏传输：本地 ‖ 远程对照面板")
-            .clicked()
-        {
-            app.show_dual = !app.show_dual;
-            if app.show_dual && app.local_entries.is_empty() && !app.local_dir.is_empty() {
-                app.local_entries = load_local_entries(&app.local_dir);
+        // 路径（唯一路径展示处，可编辑，回车导航）
+        if connected {
+            let resp = ui.add(
+                egui::TextEdit::singleline(&mut app.sessions[idx].cwd)
+                    .desired_width((ui.available_width() - 300.0).max(120.0)),
+            );
+            if resp.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter)) {
+                app.sessions[idx].user_navigated = true; // 手动输入路径，停止自动联动
+                let p = app.sessions[idx].cwd.clone();
+                app.navigate(p);
             }
+        } else {
+            ui.weak("未连接");
         }
-        if ui
-            .add(egui::Button::new("× 关闭").small())
-            .on_hover_text("关闭文件操作区域（关闭后底部保留标签条）")
-            .clicked()
-        {
-            app.show_files = false;
-        }
+        // 右侧（从右到左：关闭最右、上传、传输队列开关）
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            if ui
+                .add(egui::Button::new("× 关闭").small())
+                .on_hover_text("关闭文件操作区域（关闭后底部保留标签条）")
+                .clicked()
+            {
+                app.show_files = false;
+            }
+            // 上传主按钮（设计稿主视觉：蓝底白字「上传」）
+            if ui
+                .add_enabled(
+                    connected,
+                    egui::Button::new(RichText::new("上传").color(Color32::WHITE))
+                        .fill(Color32::from_rgb(59, 130, 246)),
+                )
+                .clicked()
+            {
+                if let Some(path) = rfd::FileDialog::new().pick_file() {
+                    let dir = app.sessions[idx].cwd.clone();
+                    let id = app.sessions[idx].id.clone();
+                    let name = path
+                        .file_name()
+                        .map(|n| n.to_string_lossy().into_owned())
+                        .unwrap_or_else(|| "文件".to_string());
+                    app.start_transfer(true, name, false);
+                    app.status_set("上传中...");
+                    app.send(FsMsg::For {
+                        id,
+                        msg: FsInner::Upload {
+                            local: path,
+                            remote_dir: dir,
+                        },
+                    });
+                }
+            }
+            // 传输队列开关：带任务计数（对齐设计稿「传输队列 N 个任务」）
+            let n = app.transfer_log.len();
+            if ui
+                .add(egui::Button::new(format!("📋 传输队列 {n} 个任务")).small())
+                .on_hover_text("显示 / 隐藏右侧传输队列（高度跟随文件区域）")
+                .clicked()
+            {
+                app.show_transfer = !app.show_transfer;
+            }
+        });
     });
     ui.separator();
 
