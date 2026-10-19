@@ -2373,7 +2373,8 @@ fn transfer_panel_content(ui: &mut egui::Ui, app: &mut SshApp) {
                     let (icon_rect, _) =
                         ui.allocate_exact_size(egui::vec2(15.0, 13.0), egui::Sense::hover());
                     paint_file_icon(ui.painter(), icon_rect, r.is_dir, false, false, true);
-                    ui.label(RichText::new(&r.name).color(black));
+                    // 文件名按面板宽度截断，避免长文件名把右侧状态列挤出可视区
+                    ui.label(RichText::new(truncate_wide(&r.name, 18)).color(black));
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         ui.label(RichText::new(status_icon).color(status_color));
                         ui.label(RichText::new(&r.time).color(gray));
