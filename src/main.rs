@@ -4570,19 +4570,24 @@ fn now_compact() -> String {
 }
 
 /// 最近会话时间显示：今天 / 昨天 + HH:MM，更早显示 MM-DD HH:MM。
+/// 兼容旧版 recent.tsv 里的「今天 HH:MM:SS」格式（含中文，不能按字节切）。
 fn recent_display(when: &str) -> String {
-    if when.len() < 11 {
+    if when.starts_with("今天 ") || when.starts_with("昨天 ") {
         return when.to_string();
     }
-    let (date, time) = when.split_at(5); // "MM-DD" + " HH:MM"
-    let today = chrono::Local::now().format("%m-%d").to_string();
-    let yesterday = (chrono::Local::now() - chrono::Duration::days(1))
-        .format("%m-%d")
-        .to_string();
-    if date == today {
-        format!("今天{time}")
-    } else if date == yesterday {
-        format!("昨天{time}")
+    if when.len() >= 11 && when.is_char_boundary(5) {
+        let (date, time) = when.split_at(5); // "MM-DD" + " HH:MM"
+        let today = chrono::Local::now().format("%m-%d").to_string();
+        let yesterday = (chrono::Local::now() - chrono::Duration::days(1))
+            .format("%m-%d")
+            .to_string();
+        if date == today {
+            format!("今天{time}")
+        } else if date == yesterday {
+            format!("昨天{time}")
+        } else {
+            when.to_string()
+        }
     } else {
         when.to_string()
     }
