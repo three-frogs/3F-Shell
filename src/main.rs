@@ -1332,7 +1332,7 @@ impl eframe::App for SshApp {
         // 文件面板：高度完全由用户手动拖动分隔条控制（无拖动时保持不变）。
         // 默认高度首次按窗口一半固定；之后仅拖动分隔条时更新。
         if self.files_h.is_none() {
-            self.files_h = Some((ctx.available_rect().height() * 0.5).clamp(120.0, 900.0));
+            self.files_h = Some((ctx.available_rect().height() * 0.7).clamp(120.0, 900.0));
         }
         if self.show_files {
             egui::TopBottomPanel::bottom("files_panel")
@@ -1726,7 +1726,7 @@ fn left_panel(ui: &mut egui::Ui, app: &mut SshApp) {
     let mut remove_idx: Option<usize> = None;
     let mut to_connect: Option<SavedAccount> = None;
     // 服务器列表占左侧栏约一半高度，超出部分用滚动条查看（下半区为系统信息）
-    let list_h = (ui.available_height() * 0.52).max(80.0);
+    let list_h = (ui.available_height() * 0.42).max(80.0);
     egui::ScrollArea::vertical()
         .max_height(list_h)
         .auto_shrink([false, false])
@@ -1814,7 +1814,7 @@ fn left_panel(ui: &mut egui::Ui, app: &mut SshApp) {
     }
     // 系统信息区：与上方服务器列表各占一半固定高度（可独立滚动）
     ui.separator();
-    let sys_h = (ui.available_height() * 0.46).max(70.0);
+    let sys_h = (ui.available_height() * 0.55).max(120.0);
     egui::ScrollArea::vertical()
         .max_height(sys_h)
         .auto_shrink([false, false])
