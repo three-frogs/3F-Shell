@@ -1329,23 +1329,6 @@ impl eframe::App for SshApp {
             )
             .show(ctx, |ui| left_panel(ui, self));
 
-        // 右侧面板：系统信息 + 传输队列（常驻，点击"记录"按钮切换显隐）
-        if self.show_transfer {
-            egui::SidePanel::right("transfer_side")
-                .resizable(true)
-                .default_width(264.0)
-                .frame(
-                    egui::Frame::new()
-                        .fill(Color32::from_rgb(255, 255, 255))
-                        .inner_margin(egui::Margin::symmetric(8, 6)),
-                )
-                .show(ctx, |ui| {
-                    system_info_block(ui, self);
-                    ui.separator();
-                    transfer_panel_content(ui, self);
-                });
-        }
-
         // 文件面板：高度完全由用户手动拖动分隔条控制（无拖动时保持不变）。
         // 默认高度首次按窗口一半固定；之后仅拖动分隔条时更新。
         if self.files_h.is_none() {
@@ -1742,9 +1725,10 @@ fn left_panel(ui: &mut egui::Ui, app: &mut SshApp) {
     let kw = app.search.trim().to_lowercase();
     let mut remove_idx: Option<usize> = None;
     let mut to_connect: Option<SavedAccount> = None;
-    // 每个账号单行展示；最多 8 行，超出部分用滚动条查看
+    // 服务器列表占左侧栏约一半高度，超出部分用滚动条查看（下半区为系统信息）
+    let list_h = (ui.available_height() * 0.52).max(80.0);
     egui::ScrollArea::vertical()
-        .max_height(8.0 * 20.0 + 2.0)
+        .max_height(list_h)
         .auto_shrink([false, false])
         .show(ui, |ui| {
             // 按分组聚类显示（保留分组首次出现顺序；组内保持原顺序）
@@ -1828,7 +1812,15 @@ fn left_panel(ui: &mut egui::Ui, app: &mut SshApp) {
         save_accounts(&app.accounts);
         app.status_set("账号已删除");
     }
-    // 左侧栏仅保留服务器列表（对齐设计稿）；连接状态 / 系统信息 / 断开连接见终端标题栏与右侧面板
+    // 系统信息区：与上方服务器列表各占一半固定高度（可独立滚动）
+    ui.separator();
+    let sys_h = (ui.available_height() * 0.46).max(70.0);
+    egui::ScrollArea::vertical()
+        .max_height(sys_h)
+        .auto_shrink([false, false])
+        .show(ui, |ui| {
+            system_info_block(ui, app);
+        });
 }
 
 /// 系统信息区（CPU / 内存 / 硬盘柱状图 + 预警阈值），显示在右侧传输队列面板顶部。
@@ -2140,7 +2132,7 @@ fn term_panel(ui: &mut egui::Ui, app: &mut SshApp) {
                 app.close_tab(idx);
             }
         }
-        // 右上角：文件面板开关 + 传输队列面板开关（右侧常驻面板）
+        // 右上角：文件面板开关（传输队列开关已移至文件区域右上侧）
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             let file_btn = if app.show_files { "📂 文件:开" } else { "📂 文件:关" };
             let fbtn = ui
@@ -2148,13 +2140,6 @@ fn term_panel(ui: &mut egui::Ui, app: &mut SshApp) {
                 .on_hover_text("显示 / 隐藏文件操作区域");
             if fbtn.clicked() {
                 app.show_files = !app.show_files;
-            }
-            let icon = if app.show_transfer { "📋 队列:开" } else { "📋 队列:关" };
-            let resp = ui
-                .add(egui::Button::new(icon).small())
-                .on_hover_text("显示 / 隐藏右侧传输队列面板");
-            if resp.clicked() {
-                app.show_transfer = !app.show_transfer;
             }
         });
     });
@@ -3383,6 +3368,15 @@ fn files_panel(ui: &mut egui::Ui, app: &mut SshApp) {
                 app.local_entries = load_local_entries(&app.local_dir);
             }
         }
+        ui.separator();
+        let qbtn = if app.show_transfer { "📋 队列:开" } else { "📋 队列:关" };
+        if ui
+            .add(egui::Button::new(qbtn).small())
+            .on_hover_text("显示 / 隐藏右侧传输队列（高度跟随文件区域）")
+            .clicked()
+        {
+            app.show_transfer = !app.show_transfer;
+        }
         if ui
             .add(egui::Button::new("✕ 关闭").small())
             .on_hover_text("关闭文件操作区域（关闭后底部保留标签条）")
@@ -3410,14 +3404,17 @@ fn files_panel(ui: &mut egui::Ui, app: &mut SshApp) {
     });
     ui.separator();
 
-    if !connected {
-        ui.centered_and_justified(|ui| {
-            ui.label(RichText::new("连接远程主机后，此处显示远程文件").color(Color32::GRAY).weak());
-        });
-        return;
-    }
-
-    let mut actions: Vec<FilesAction> = Vec::new();
+    // 主体水平分栏：左侧文件内容 | 右侧传输队列（高度跟随文件区域）
+    ui.horizontal(|ui| {
+        // 左列：路径 + 文件内容
+        ui.vertical(|ui| {
+            ui.set_width(ui.available_width() - 252.0);
+            if !connected {
+                ui.centered_and_justified(|ui| {
+                    ui.label(RichText::new("连接远程主机后，此处显示远程文件").color(Color32::GRAY).weak());
+                });
+            } else {
+                let mut actions: Vec<FilesAction> = Vec::new();
     // 拖放上传：从资源管理器拖入窗口任意位置放开即上传到当前目录
     // （文件/文件夹均支持，文件夹递归上传）
     if connected {
@@ -3630,7 +3627,17 @@ fn files_panel(ui: &mut egui::Ui, app: &mut SshApp) {
             }
         }
     }
-    ui.weak("提示：终端区域点击后可输入命令（支持 vim / top / htop 等全屏程序）；文件区域单击目录进入、双击文件用默认编辑器打开，顶部按钮可上传 / 下载 / 新建 / 删除 / 重命名。");
+        }
+    });
+        // 右列：传输队列（高度跟随文件区域）
+        if app.show_transfer {
+            ui.separator();
+            ui.vertical(|ui| {
+                ui.set_width(240.0);
+                transfer_panel_content(ui, app);
+            });
+        }
+    });
 }
 
 /// 远程文件表格（单栏 / 双栏共用）：名称/大小/修改时间/权限 + 单击/双击/右键。
