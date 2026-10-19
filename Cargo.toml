@@ -26,6 +26,8 @@ uuid = { version = "1", features = ["v4"] }
 chrono = "0.4"
 tracing = "0.1"
 tracing-subscriber = "0.3"
+# 跨平台打开文件（双击远程文件用系统默认应用打开）
+opener = "0.7"
 
 # 原生文件对话框（平台后端：Windows=win32、Linux=xdg-portal、macOS=macos）
 [target.'cfg(target_os = "windows")'.dependencies]

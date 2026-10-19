@@ -93,6 +93,8 @@ struct TermState {
     term_cwd: Option<String>,
     /// 上次识别到的提示符文本（防止重复触发）
     last_prompt: Option<String>,
+    /// 最近一次提交的命令行（用于「最近会话」展示）
+    last_cmd: String,
     /// 回看历史时的滚动偏移（0 = 最新，>0 = 向上回看行数）
     scroll_offset: usize,
     /// 鼠标选择：锚点与当前点 ((row,col),(row,col))；None = 无选择
@@ -107,6 +109,7 @@ impl TermState {
             pending_line: Vec::new(),
             term_cwd: None,
             last_prompt: None,
+            last_cmd: String::new(),
             scroll_offset: 0,
             sel: None,
         }
@@ -121,6 +124,10 @@ impl TermState {
                 0x0d | 0x0a => {
                     let line = String::from_utf8_lossy(&self.pending_line).into_owned();
                     self.pending_line.clear();
+                    let line_trim = line.trim();
+                    if !line_trim.is_empty() {
+                        self.last_cmd = line_trim.to_string();
+                    }
                     if let Some(t) = parse_cd_line(&line, &self.term_cwd, user) {
                         nav = Some(t);
                     }
@@ -377,8 +384,14 @@ struct SshApp {
     password: String,
     key_path: Option<PathBuf>,
     remember_pwd: bool,
+    /// 新增账号对话框中的分组名输入。
+    new_group: String,
     // 已存账号
     accounts: Vec<SavedAccount>,
+    /// 左侧服务器列表搜索关键字。
+    search: String,
+    /// 最近会话（快速重连）。
+    recent: Vec<RecentSession>,
     // 打开的连接标签页
     sessions: Vec<ConnTab>,
     active: usize,
@@ -401,6 +414,32 @@ struct SshApp {
     show_files: bool,
     /// 文件面板固定高度（首次按窗口一半计算，之后保持不变，防止高度漂移动画）
     files_h: Option<f32>,
+    /// 双击远程文件后待打开的本地临时文件（下载完成后触发系统默认应用）。
+    pending_open: Option<PathBuf>,
+    /// 双栏文件传输模式（本地 ⇄ 远程对照面板）。
+    show_dual: bool,
+    /// 本地面板当前目录。
+    local_dir: String,
+    /// 本地面板目录列表。
+    local_entries: Vec<LocalEntry>,
+    /// 本地面板选中项（绝对路径）。
+    local_selected: Option<String>,
+    /// 当前传输任务进度 (done, total)。
+    cur_prog: Option<(u64, u64)>,
+    /// 当前传输瞬时速率（字节/秒）。
+    cur_rate: f64,
+    /// 速率计算锚点（上次进度采样）。
+    last_prog: Option<(u64, u64, std::time::Instant)>,
+}
+
+/// 本地面板的一行条目。
+#[derive(Clone)]
+struct LocalEntry {
+    name: String,
+    path: String,
+    is_dir: bool,
+    size: u64,
+    mtime: String,
 }
 
 /// 一条传输明细记录。
@@ -618,7 +657,10 @@ impl SshApp {
             password: String::new(),
             key_path: None,
             remember_pwd: true,
+            new_group: String::new(),
             accounts: load_accounts(),
+            search: String::new(),
+            recent: load_recent(),
             sessions: Vec::new(),
             active: 0,
             next_token: 1,
@@ -633,6 +675,14 @@ impl SshApp {
             active_transfer: None,
             show_files: true,
             files_h: None,
+            pending_open: None,
+            show_dual: false,
+            local_dir: home_dir_str(),
+            local_entries: Vec::new(),
+            local_selected: None,
+            cur_prog: None,
+            cur_rate: 0.0,
+            last_prog: None,
         }
     }
 
@@ -723,6 +773,26 @@ impl SshApp {
         if idx >= self.sessions.len() {
             return;
         }
+        // 关闭前把最近命令写入「最近会话」并落盘
+        {
+            let acc = self.sessions[idx].account.clone();
+            let cmd = self.sessions[idx]
+                .term
+                .as_ref()
+                .map(|tm| tm.last_cmd.clone())
+                .unwrap_or_default();
+            upsert_recent(
+                &mut self.recent,
+                RecentSession {
+                    name: acc.name,
+                    host: acc.host,
+                    port: acc.port,
+                    user: acc.user,
+                    cmd,
+                    when: String::new(),
+                },
+            );
+        }
         let id = self.sessions[idx].id.clone();
         if !id.is_empty() {
             self.send(FsMsg::For {
@@ -758,6 +828,7 @@ impl SshApp {
                 .key_path
                 .as_ref()
                 .map(|p| p.to_string_lossy().into_owned()),
+            group: String::new(),
         }
     }
 
@@ -784,8 +855,20 @@ impl SshApp {
                             tab.sync_timer = 0.0;
                             tab.focus_term = true; // 连接成功后键盘焦点交给命令行
                         }
-                        // 全局动作：账号自动保存 + 初始目录与系统信息
+                        // 全局动作：账号自动保存 + 初始目录与系统信息 + 最近会话
                         self.save_current_account();
+                        let acc = self.sessions[idx].account.clone();
+                        upsert_recent(
+                            &mut self.recent,
+                            RecentSession {
+                                name: acc.name,
+                                host: acc.host,
+                                port: acc.port,
+                                user: acc.user,
+                                cmd: String::new(),
+                                when: String::new(),
+                            },
+                        );
                         let id2 = self.sessions[idx].id.clone();
                         self.send(FsMsg::For {
                             id: id2,
@@ -819,9 +902,23 @@ impl SshApp {
                             break;
                         }
                     }
+                    // 瞬时速率：按 0.1s 采样间隔计算（同任务同总量）
+                    let now = std::time::Instant::now();
+                    if let Some((ld, lt, lt0)) = self.last_prog {
+                        let dt = now.duration_since(lt0).as_secs_f64();
+                        if lt == total && dt >= 0.1 {
+                            let speed = done.saturating_sub(ld) as f64 / dt;
+                            self.cur_rate = speed.max(0.0);
+                        }
+                    }
+                    self.last_prog = Some((done, total, now));
+                    self.cur_prog = Some((done, total));
                 }
                 BackMsg::TransferStart { up } => {
                     self.active_transfer = Some(up);
+                    self.cur_prog = None;
+                    self.cur_rate = 0.0;
+                    self.last_prog = None;
                 }
                 BackMsg::For { id, msg } => {
                     // Ping 失效 -> 自动重连；其余按会话路由
@@ -983,6 +1080,9 @@ impl SshApp {
             }
             BackInner::Upload(Ok(n)) => {
                 self.active_transfer = None;
+                self.cur_prog = None;
+                self.cur_rate = 0.0;
+                self.last_prog = None;
                 finish_transfer(&mut self.transfer_log, true, Some(n), true, "完成".to_string());
                 self.sessions[idx].status = if n > 0 {
                     format!("上传完成（{}）", fmt_size(n))
@@ -993,20 +1093,34 @@ impl SshApp {
             }
             BackInner::Upload(Err(e)) => {
                 self.active_transfer = None;
+                self.cur_prog = None;
+                self.cur_rate = 0.0;
+                self.last_prog = None;
                 finish_transfer(&mut self.transfer_log, true, None, false, e.clone());
                 self.sessions[idx].status = format!("上传失败：{e}");
             }
             BackInner::Download(Ok(n)) => {
                 self.active_transfer = None;
+                self.cur_prog = None;
+                self.cur_rate = 0.0;
+                self.last_prog = None;
                 finish_transfer(&mut self.transfer_log, false, Some(n), true, "完成".to_string());
                 self.sessions[idx].status = if n > 0 {
                     format!("下载完成（{}）", fmt_size(n))
                 } else {
                     "下载完成".into()
                 };
+                // 双击远程文件下载：完成后用系统默认应用打开
+                if let Some(p) = self.pending_open.take() {
+                    let _ = opener::open(&p);
+                    self.sessions[idx].status = "已用默认应用打开".into();
+                }
             }
             BackInner::Download(Err(e)) => {
                 self.active_transfer = None;
+                self.cur_prog = None;
+                self.cur_rate = 0.0;
+                self.last_prog = None;
                 finish_transfer(&mut self.transfer_log, false, None, false, e.clone());
                 self.sessions[idx].status = format!("下载失败：{e}");
             }
@@ -1235,6 +1349,12 @@ impl eframe::App for SshApp {
                 });
         }
 
+        // 底部状态栏：当前连接 / 模式切换 / 编码 / SSH 版本 / 时间
+        egui::TopBottomPanel::bottom("status_bar")
+            .exact_height(24.0)
+            .frame(compact_frame())
+            .show(ctx, |ui| status_bar(ui, self));
+
         // 终端区域吃掉全部剩余空间，避免底部留白
         egui::CentralPanel::default()
             .frame(compact_frame())
@@ -1349,6 +1469,8 @@ impl eframe::App for SshApp {
                         ui.label("密码（可留空，与密钥二选一）：");
                         ui.add(egui::TextEdit::singleline(&mut self.password).password(true).desired_width(260.0));
                         ui.checkbox(&mut self.remember_pwd, "记住密码（明文保存到本地）");
+                        ui.label("分组（可选，如「生产环境」「开发测试」）：");
+                        ui.add(egui::TextEdit::singleline(&mut self.new_group).desired_width(260.0).hint_text("未分组"));
                         ui.horizontal(|ui| {
                             if ui.button("选择密钥...").clicked() {
                                 if let Some(p) = rfd::FileDialog::new()
@@ -1401,6 +1523,7 @@ impl eframe::App for SshApp {
                                             user,
                                             password,
                                             key,
+                                            group: self.new_group.trim().to_string(),
                                         },
                                     );
                                     save_accounts(&self.accounts);
@@ -1557,18 +1680,24 @@ fn tab_bar(ui: &mut egui::Ui, app: &mut SshApp) {
 // =====================================================================
 
 fn left_panel(ui: &mut egui::Ui, app: &mut SshApp) {
-    // ---- 已存账号 ----
+    // ---- 服务器 ----
     ui.horizontal(|ui| {
-        ui.strong(RichText::new("已存账号").color(Color32::WHITE));
+        ui.strong(RichText::new("服务器").color(Color32::WHITE));
         if ui.small_button("＋ 新增").clicked() {
             app.dialog_input.clear();
             app.dialog = Some(DialogKind::NewAccount);
         }
     });
+    ui.add(
+        egui::TextEdit::singleline(&mut app.search)
+            .hint_text("搜索服务器...")
+            .desired_width(f32::INFINITY),
+    );
     ui.separator();
     if app.accounts.is_empty() {
         ui.weak("暂无账号，点「＋ 新增」添加");
     }
+    let kw = app.search.trim().to_lowercase();
     let mut remove_idx: Option<usize> = None;
     let mut to_connect: Option<SavedAccount> = None;
     // 每个账号单行展示；最多 8 行，超出部分用滚动条查看
@@ -1576,33 +1705,64 @@ fn left_panel(ui: &mut egui::Ui, app: &mut SshApp) {
         .max_height(8.0 * 20.0 + 2.0)
         .auto_shrink([false, false])
         .show(ui, |ui| {
-            for (i, a) in app.accounts.iter().enumerate() {
-                let label0 = format!("{}  {}", a.name, a.host);
-                let btn_w = (ui.available_width() - 26.0).max(70.0);
-                let max_cw = ((btn_w / 7.4) as usize).max(6); // 13px 字体半角字符宽约 7.4px
-                let label = truncate_wide(&label0, max_cw);
-                let active = app.sessions.iter().any(|t| {
-                    t.account.host == a.host
-                        && t.account.port == a.port
-                        && t.account.user == a.user
-                });
-                let btn = if active {
-                    egui::Button::new(RichText::new(label).strong())
-                } else {
-                    egui::Button::new(label)
-                };
-                let mut clicked = false;
-                let mut del = false;
-                ui.horizontal(|ui| {
-                    clicked = ui.add_sized([btn_w, 18.0], btn).clicked();
-                    del = ui.small_button("×").clicked();
-                });
-                if clicked {
-                    to_connect = Some(a.clone());
+            // 按分组聚类显示（保留分组首次出现顺序；组内保持原顺序）
+            let mut groups: Vec<String> = Vec::new();
+            for a in &app.accounts {
+                if !groups.contains(&a.group) {
+                    groups.push(a.group.clone());
                 }
-                if del {
-                    remove_idx = Some(i);
+            }
+            let mut shown = 0;
+            for g in &groups {
+                let members: Vec<(usize, &SavedAccount)> = app
+                    .accounts
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, a)| &a.group == g)
+                    .filter(|(_, a)| {
+                        kw.is_empty()
+                            || a.name.to_lowercase().contains(&kw)
+                            || a.host.to_lowercase().contains(&kw)
+                            || a.user.to_lowercase().contains(&kw)
+                    })
+                    .collect();
+                if members.is_empty() {
+                    continue;
                 }
+                let gname = if g.is_empty() { "未分组" } else { g.as_str() };
+                ui.weak(RichText::new(format!("▸ {gname}")).small());
+                for (i, a) in members {
+                    shown += 1;
+                    let label0 = format!("{}  {}", a.name, a.host);
+                    let btn_w = (ui.available_width() - 26.0).max(70.0);
+                    let max_cw = ((btn_w / 7.4) as usize).max(6); // 13px 字体半角字符宽约 7.4px
+                    let label = truncate_wide(&label0, max_cw);
+                    let active = app.sessions.iter().any(|t| {
+                        t.account.host == a.host
+                            && t.account.port == a.port
+                            && t.account.user == a.user
+                    });
+                    let btn = if active {
+                        egui::Button::new(RichText::new(label).strong())
+                    } else {
+                        egui::Button::new(label)
+                    };
+                    let mut clicked = false;
+                    let mut del = false;
+                    ui.horizontal(|ui| {
+                        clicked = ui.add_sized([btn_w, 18.0], btn).clicked();
+                        del = ui.small_button("×").clicked();
+                    });
+                    if clicked {
+                        to_connect = Some(a.clone());
+                    }
+                    if del {
+                        remove_idx = Some(i);
+                    }
+                }
+            }
+            if shown == 0 && !kw.is_empty() {
+                ui.weak("无匹配账号");
             }
         });
     // 循环外统一处理，避免与 app.accounts 的迭代借用冲突
@@ -1687,17 +1847,28 @@ fn left_panel(ui: &mut egui::Ui, app: &mut SshApp) {
         }
         for (k, v) in &sysinfo {
             match k.as_str() {
-                // CPU / 内存 / 硬盘：柱状图 + 详细文本
+                // CPU / 内存 / 硬盘：柱状图 + 详细文本 + 超过预警阈值提示
                 "CPU" | "内存" | "硬盘" => {
                     ui.horizontal(|ui| {
                         ui.weak(format!("{k}:"));
                         if let Some(pct) = metric_pct(v) {
+                            let warn = pct >= 80.0;
                             ui.add(
                                 egui::ProgressBar::new(pct / 100.0)
                                     .desired_width(160.0)
-                                    .fill(usage_color(pct))
+                                    .fill(if warn {
+                                        Color32::from_rgb(220, 60, 60)
+                                    } else {
+                                        usage_color(pct)
+                                    })
                                     .text(format!("{pct:.0}%")),
                             );
+                            if warn {
+                                ui.colored_label(
+                                    Color32::from_rgb(255, 110, 110),
+                                    "⚠ 超预警阈值 80%",
+                                );
+                            }
                         }
                     });
                     ui.weak(v.clone());
@@ -1759,6 +1930,51 @@ fn usage_color(pct: f32) -> Color32 {
 }
 
 /// 当前时间 HH:MM:SS。
+/// 底部状态栏：当前连接 / 文件传输模式切换 / SSH 版本 / 编码 / 时间。
+fn status_bar(ui: &mut egui::Ui, app: &mut SshApp) {
+    ui.horizontal(|ui| {
+        // 左侧：当前连接状态
+        let conn = app.sessions.get(app.active_idx()).map(|t| {
+            if t.connected {
+                format!("已连接 {} ({}:{})", t.account.name, t.account.host, t.account.port)
+            } else if t.connecting {
+                format!("连接中... {}", t.account.name)
+            } else {
+                format!("未连接 {}", t.account.name)
+            }
+        });
+        match conn {
+            Some(s) => {
+                ui.colored_label(Color32::from_rgb(120, 200, 120), s);
+            }
+            None => {
+                ui.colored_label(Color32::GRAY, "未连接");
+            }
+        }
+        ui.separator();
+        // 文件传输模式切换（对齐设计稿：状态栏展示模式）
+        let mode_btn = if app.show_files {
+            "📂 文件传输:开"
+        } else {
+            "📂 文件传输:关"
+        };
+        if ui
+            .add(egui::Button::new(mode_btn).small())
+            .on_hover_text("显示 / 隐藏文件操作区域")
+            .clicked()
+        {
+            app.show_files = !app.show_files;
+        }
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            ui.weak(now_hms());
+            ui.separator();
+            ui.weak("UTF-8");
+            ui.separator();
+            ui.weak("SSH-2.0");
+        });
+    });
+}
+
 fn now_hms() -> String {
     chrono::Local::now().format("%H:%M:%S").to_string()
 }
@@ -1766,6 +1982,124 @@ fn now_hms() -> String {
 // =====================================================================
 // 终端面板（上半部分）
 // =====================================================================
+
+/// 无连接时的中央快速连接面板（对齐设计稿：快速连接表单 + 最近会话）。
+fn quick_connect_panel(ui: &mut egui::Ui, app: &mut SshApp) {
+    let avail = ui.available_size();
+    let (rect, _) = ui.allocate_exact_size(avail, egui::Sense::hover());
+    let painter = ui.painter();
+    painter.rect_filled(rect, 0.0, Color32::from_rgb(12, 12, 14));
+    let inner = rect.shrink2(egui::vec2(28.0, 18.0));
+    let mut cui = ui.new_child(egui::UiBuilder::new().max_rect(inner));
+
+    cui.add_space(4.0);
+    cui.heading(RichText::new("连接到服务器").size(22.0).color(Color32::WHITE));
+    cui.add_space(4.0);
+    cui.weak("输入主机地址快速连接，或从左侧选择已保存的服务器");
+    cui.add_space(12.0);
+    cui.strong(RichText::new("快速连接").size(14.0).color(Color32::WHITE));
+    cui.add_space(4.0);
+
+    egui::Grid::new("quick_grid")
+        .num_columns(2)
+        .spacing(egui::vec2(10.0, 6.0))
+        .show(&mut cui, |ui| {
+            ui.label("用户名");
+            ui.add(egui::TextEdit::singleline(&mut app.user).desired_width(240.0).hint_text("root"));
+            ui.end_row();
+            ui.label("主机地址");
+            ui.add(egui::TextEdit::singleline(&mut app.host).desired_width(240.0).hint_text("root@10.0.1.24 或 10.0.1.24"));
+            ui.end_row();
+            ui.label("端口");
+            ui.add(egui::TextEdit::singleline(&mut app.port).desired_width(90.0));
+            ui.end_row();
+            ui.label("密码");
+            ui.add(
+                egui::TextEdit::singleline(&mut app.password)
+                    .password(true)
+                    .desired_width(240.0)
+                    .hint_text("留空则使用密钥或免密登录"),
+            );
+            ui.end_row();
+        });
+    cui.add_space(4.0);
+    cui.horizontal(|ui| {
+        if ui.button("导入密钥...").clicked() {
+            if let Some(p) = rfd::FileDialog::new()
+                .add_filter("私钥", &["pem", "key"])
+                .pick_file()
+            {
+                app.key_path = Some(p);
+            }
+        }
+        if let Some(kp) = &app.key_path {
+            let kn = kp
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            ui.weak(format!("密钥: {kn}"));
+        }
+        if ui.button(RichText::new("连 接").strong()).clicked() {
+            let acc = app.current_account();
+            app.connect_account(&acc);
+        }
+    });
+    cui.add_space(4.0);
+    cui.weak("支持 SSH 密钥 / 密码登录，密钥可从本机一键导入");
+    cui.add_space(16.0);
+    cui.strong(RichText::new("最近会话").size(14.0).color(Color32::WHITE));
+    cui.add_space(4.0);
+    if app.recent.is_empty() {
+        cui.weak("暂无最近会话，连接一次后自动记录");
+    } else {
+        let mut to_reconnect: Option<SavedAccount> = None;
+        let list_h = (rect.height() - 330.0).max(60.0);
+        egui::ScrollArea::vertical()
+            .max_height(list_h)
+            .auto_shrink([false, false])
+            .show(&mut cui, |ui| {
+                let recent = app.recent.clone();
+                for r in &recent {
+                    let label = if r.cmd.is_empty() {
+                        format!("{}  ·  {}  ({})", r.name, r.host, r.when)
+                    } else {
+                        format!("{}  ·  {}  |  {}", r.name, r.cmd, r.when)
+                    };
+                    if ui
+                        .add_sized(
+                            [260.0, 18.0],
+                            egui::Button::new(
+                                RichText::new(truncate_wide(&label, 40)).size(12.5),
+                            ),
+                        )
+                        .clicked()
+                    {
+                        to_reconnect = Some(SavedAccount {
+                            name: r.name.clone(),
+                            host: r.host.clone(),
+                            port: r.port,
+                            user: r.user.clone(),
+                            password: None,
+                            key: None,
+                            group: String::new(),
+                        });
+                    }
+                }
+            });
+        if let Some(acc) = to_reconnect {
+            // 最近会话只记 host/user：优先用已存账号补全密码/密钥，否则直接尝试连接
+            let saved = app
+                .accounts
+                .iter()
+                .find(|a| a.host == acc.host && a.port == acc.port && a.user == acc.user)
+                .cloned();
+            match saved {
+                Some(s) => app.connect_account(&s),
+                None => app.connect_account(&acc),
+            }
+        }
+    }
+}
 
 fn term_panel(ui: &mut egui::Ui, app: &mut SshApp) {
     let (connected, shell_alive) = app
@@ -1824,15 +2158,8 @@ fn term_panel(ui: &mut egui::Ui, app: &mut SshApp) {
     });
     ui.separator();
     if app.sessions.is_empty() {
-        // 无任何连接：终端区域显示引导提示（黑底白字）
-        let avail = ui.available_size();
-        let (rect, _) = ui.allocate_exact_size(avail, egui::Sense::hover());
-        let painter = ui.painter();
-        painter.rect_filled(rect, 0.0, Color32::BLACK);
-        let font_id = FontId::monospace(13.0);
-        let galley =
-            painter.layout_no_wrap("点击左侧账号开始连接，或点「＋ 新增」录入账号".to_string(), font_id.clone(), Color32::from_rgba_unmultiplied(255, 255, 255, 160));
-        painter.galley(egui::pos2(rect.left() + 8.0, rect.top() + 8.0), galley, Color32::WHITE);
+        // 无任何连接：终端区域显示快速连接面板（快速连接表单 + 最近会话）
+        quick_connect_panel(ui, app);
         return;
     }
     let idx = app.active_idx();
@@ -1947,6 +2274,52 @@ fn transfer_panel_content(ui: &mut egui::Ui, app: &mut SshApp) {
         });
     });
     ui.separator();
+    // 实时传输队列概览：当前任务进度 + 瞬时速率 + 全部暂停
+    if let Some((done, total)) = app.cur_prog {
+        if total > 0 && app.active_transfer.is_some() {
+            let up = app.active_transfer == Some(true);
+            let pct = (done.min(total) as f32 / total as f32).clamp(0.0, 1.0);
+            let dir_icon = if up { "⬆" } else { "⬇" };
+            ui.horizontal(|ui| {
+                ui.strong(
+                    RichText::new(format!("{dir_icon} 传输队列  1 个任务")).color(black),
+                );
+                if app.cur_rate > 0.0 {
+                    ui.label(
+                        RichText::new(format!("{} / s", fmt_size(app.cur_rate as u64)))
+                            .color(gray),
+                    );
+                }
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui
+                        .add(egui::Button::new(RichText::new("⏸ 全部暂停").color(black)).small())
+                        .on_hover_text("取消当前传输任务")
+                        .clicked()
+                    {
+                        let sid = app.sessions.get(app.active_idx()).map(|t| t.id.clone());
+                        if let Some(sid) = sid {
+                            app.send(FsMsg::For {
+                                id: sid,
+                                msg: FsInner::CancelTransfer { up },
+                            });
+                        }
+                    }
+                });
+            });
+            ui.add(
+                egui::ProgressBar::new(pct)
+                    .desired_width(ui.available_width() - 8.0)
+                    .fill(Color32::from_rgb(40, 120, 220))
+                    .text(format!(
+                        "{:.0}%  {} / {}",
+                        pct * 100.0,
+                        fmt_size(done),
+                        fmt_size(total)
+                    )),
+            );
+            ui.separator();
+        }
+    }
     if app.transfer_log.is_empty() {
         ui.label(RichText::new("暂无传输记录").color(gray));
         return;
@@ -2996,6 +3369,17 @@ fn files_panel(ui: &mut egui::Ui, app: &mut SshApp) {
             }
         }
         ui.separator();
+        let dual_btn = if app.show_dual { "⇄ 单栏" } else { "⇄ 双栏" };
+        if ui
+            .add(egui::Button::new(dual_btn).small())
+            .on_hover_text("双栏传输：本地 ⇄ 远程对照面板")
+            .clicked()
+        {
+            app.show_dual = !app.show_dual;
+            if app.show_dual && app.local_entries.is_empty() && !app.local_dir.is_empty() {
+                app.local_entries = load_local_entries(&app.local_dir);
+            }
+        }
         if ui
             .add(egui::Button::new("✕ 关闭").small())
             .on_hover_text("关闭文件操作区域（关闭后底部保留标签条）")
@@ -3063,132 +3447,96 @@ fn files_panel(ui: &mut egui::Ui, app: &mut SshApp) {
             );
         }
     }
-    // 表格占满剩余高度（底部留一行小字提示，不产生面板级空白）
-    let hint_h = ui.text_style_height(&egui::TextStyle::Small) + 4.0;
-    egui::ScrollArea::vertical()
-        .auto_shrink([false, false])
-        .max_height((ui.available_height() - hint_h).max(40.0))
-        .show(ui, |ui| {
-            TableBuilder::new(ui)
-                .vscroll(false) // 关闭表格内部滚动，统一由外层 ScrollArea 提供垂直滚动条
-                .striped(true)
-                .sense(egui::Sense::click()) // 整行可交互：任意列右键都弹出菜单
-                .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
-                .column(Column::auto().at_least(220.0))
-                .column(Column::initial(110.0).at_least(70.0))
-                .column(Column::initial(150.0))
-                .column(Column::remainder())
-                .header(22.0, |mut h| {
-                    h.col(|ui| {
-                        ui.strong(RichText::new("名称").color(Color32::WHITE));
-                    });
-                    h.col(|ui| {
-                        ui.strong(RichText::new("大小").color(Color32::WHITE));
-                    });
-                    h.col(|ui| {
-                        ui.strong(RichText::new("修改时间").color(Color32::WHITE));
-                    });
-                    h.col(|ui| {
-                        ui.strong(RichText::new("权限").color(Color32::WHITE));
-                    });
-                })
-                .body(|mut body| {
-                    for entry in &app.sessions[idx].entries {
-                        let path = entry.path.clone();
-                        let is_dir = entry.is_dir;
-                        body.row(20.0, |mut row| {
-                            let selected =
-                                app.sessions[idx].selected.as_deref() == Some(path.as_str());
-                            let (r1, _) = row.col(|ui| {
-                                let color = if is_dir {
-                                    Color32::from_rgb(120, 180, 255)
-                                } else if selected {
-                                    Color32::from_rgb(210, 228, 255)
-                                } else {
-                                    ui.visuals().text_color()
-                                };
-                                // 矢量图标（替代 emoji，黑色主题下更清晰美观）
-                                let (icon_rect, _) =
-                                    ui.allocate_exact_size(egui::vec2(15.0, 13.0), egui::Sense::hover());
-                                paint_file_icon(
-                                    ui.painter(),
-                                    icon_rect,
-                                    is_dir,
-                                    entry.is_symlink,
-                                    selected,
-                                    false,
-                                );
-                                let hr = ui.horizontal(|ui| {
-                                    ui.label(RichText::new(&entry.name).color(color));
-                                });
-                                // 整行（图标+文本）可点击/双击（右键菜单在行级统一处理）
-                                let resp = ui.interact(
-                                    hr.response.rect,
-                                    ui.id().with(&path),
-                                    egui::Sense::click(),
-                                );
-                                if resp.double_clicked() && is_dir {
-                                    actions.push(FilesAction::Navigate(path.clone()));
-                                } else if resp.clicked() {
-                                    if is_dir {
-                                        actions.push(FilesAction::Navigate(path.clone()));
-                                    } else {
-                                        actions.push(FilesAction::Select(path.clone()));
-                                    }
-                                }
-                            });
-                            let (r2, _) = row.col(|ui| {
-                                if is_dir {
-                                    ui.weak("—");
-                                } else {
-                                    ui.label(entry.size.map(fmt_size).unwrap_or_else(|| "—".into()));
-                                }
-                            });
-                            let (r3, _) = row.col(|ui| {
-                                ui.weak(entry.mtime.clone().unwrap_or_default());
-                            });
-                            row.col(|ui| {
-                                ui.weak(entry.perms.clone().unwrap_or_default());
-                                // 整行 hover / 选中高亮：前三列 rect union + 当前权限列区域 = 整行
-                                let row_full = r1.union(r2).union(r3).union(ui.max_rect());
-                                let hovered = ui.rect_contains_pointer(row_full);
-                                if hovered || selected {
-                                    let bg = if selected {
-                                        Color32::from_rgba_unmultiplied(58, 88, 138, 120)
-                                    } else {
-                                        Color32::from_rgba_unmultiplied(82, 122, 182, 55)
-                                    };
-                                    ui.painter().rect_filled(row_full, 2.0, bg);
-                                }
-                                if hovered {
-                                    ui.output_mut(|o| o.cursor_icon = egui::CursorIcon::PointingHand);
-                                }
-                            });
-                            // 整行右键菜单：删除 / 下载（文件与文件夹均支持，文件夹递归处理）
-                            let menu_path = path.clone();
-                            let menu_is_dir = is_dir;
-                            row.response().context_menu(|ui| {
-                                if ui.button("⬇ 下载").clicked() {
-                                    actions.push(FilesAction::DownloadSel(menu_path.clone()));
-                                    ui.close_menu();
-                                }
-                                if ui
-                                    .button(RichText::new("🗑 删除").color(Color32::LIGHT_RED))
-                                    .clicked()
-                                {
-                                    app.dialog_old = menu_path.clone();
-                                    app.dialog = Some(DialogKind::ConfirmDelete);
-                                    ui.close_menu();
-                                }
-                                if menu_is_dir && ui.button("进入目录").clicked() {
-                                    actions.push(FilesAction::Navigate(menu_path));
-                                    ui.close_menu();
-                                }
-                            });
+    if app.show_dual {
+        // ===== 双栏传输模式：远程列表 | 传输按钮 | 本地列表 =====
+        let list_h = (ui.available_height() - 36.0).max(60.0);
+        ui.horizontal(|ui| {
+            // 左列：远程文件
+            ui.vertical(|ui| {
+                ui.set_width((ui.available_width() * 0.40).max(190.0));
+                ui.strong(RichText::new("远程").color(Color32::WHITE));
+                render_remote_table(ui, app, idx, &mut actions, list_h);
+            });
+            // 中列：传输按钮（本地选中 → 上传；远程选中 → 下载）
+            ui.vertical_centered(|ui| {
+                ui.set_width(74.0);
+                ui.add_space(70.0);
+                let local_sel = app.local_selected.clone();
+                if ui
+                    .add_enabled(
+                        connected && local_sel.is_some(),
+                        egui::Button::new("→ 上传").min_size(egui::vec2(70.0, 26.0)),
+                    )
+                    .clicked()
+                {
+                    if let Some(lp) = local_sel {
+                        let dir = app.sessions[idx].cwd.clone();
+                        let id = app.sessions[idx].id.clone();
+                        let path = PathBuf::from(&lp);
+                        let name = path
+                            .file_name()
+                            .map(|n| n.to_string_lossy().into_owned())
+                            .unwrap_or_else(|| "文件".to_string());
+                        let is_dir = path.is_dir();
+                        app.start_transfer(true, name, is_dir);
+                        app.status_set("上传中...");
+                        app.send(FsMsg::For {
+                            id,
+                            msg: FsInner::Upload {
+                                local: path,
+                                remote_dir: dir,
+                            },
                         });
                     }
-                });
+                }
+                ui.add_space(12.0);
+                let rsel = app.sessions.get(idx).and_then(|t| t.selected.clone());
+                if ui
+                    .add_enabled(
+                        connected && rsel.is_some(),
+                        egui::Button::new("← 下载").min_size(egui::vec2(70.0, 26.0)),
+                    )
+                    .clicked()
+                {
+                    if let Some(remote) = rsel {
+                        let id = app.sessions[idx].id.clone();
+                        let default_name = remote.rsplit('/').next().unwrap_or("file").to_string();
+                        let sel_is_dir = app
+                            .sessions
+                            .get(idx)
+                            .map(|t| t.entries.iter().any(|e| e.path == remote && e.is_dir))
+                            .unwrap_or(false);
+                        let local = PathBuf::from(&app.local_dir).join(&default_name);
+                        app.start_transfer(false, default_name, sel_is_dir);
+                        app.status_set("下载中...");
+                        app.send(FsMsg::For {
+                            id,
+                            msg: FsInner::Download { remote, local },
+                        });
+                    }
+                }
+            });
+            // 右列：本地面板
+            ui.vertical(|ui| {
+                ui.set_width(ui.available_width());
+                render_local_table(ui, app, list_h);
+            });
         });
+        ui.add_space(2.0);
+        ui.weak("提示：选中文件后点击中间箭头传输，或把本地文件拖入窗口上传到远程当前目录");
+    } else {
+        // 单栏模式：远程文件表格
+        let hint_h = ui.text_style_height(&egui::TextStyle::Small) + 4.0;
+        render_remote_table(
+            ui,
+            app,
+            idx,
+            &mut actions,
+            (ui.available_height() - hint_h).max(40.0),
+        );
+        ui.add_space(2.0);
+        ui.weak("提示：终端区域点击后可输入命令（支持 vim / top / htop 等全屏程序）；文件区域单击目录进入、双击文件用默认编辑器打开，顶部按钮可上传 / 下载 / 新建 / 删除 / 重命名。");
+    }
     for a in actions {
         match a {
             FilesAction::Navigate(p) => {
@@ -3250,9 +3598,279 @@ fn files_panel(ui: &mut egui::Ui, app: &mut SshApp) {
                     });
                 }
             }
+            // 双击远程文件：下载到临时目录，完成后用系统默认应用打开
+            FilesAction::OpenRemote(p) => {
+                if !app.sessions[idx].connected {
+                    continue;
+                }
+                let default_name = p.rsplit('/').next().unwrap_or("file").to_string();
+                let tmp_dir = std::env::temp_dir().join("3f-shell-open");
+                let _ = std::fs::create_dir_all(&tmp_dir);
+                let local = tmp_dir.join(format!("{}_{}", std::process::id(), default_name));
+                let id = app.sessions[idx].id.clone();
+                app.pending_open = Some(local.clone());
+                app.start_transfer(false, default_name, false);
+                app.status_set("下载中，完成后自动打开...");
+                app.send(FsMsg::For {
+                    id,
+                    msg: FsInner::Download {
+                        remote: p,
+                        local,
+                    },
+                });
+            }
         }
     }
-    ui.weak("提示：终端区域点击后可输入命令（支持 vim / top / htop 等全屏程序）；文件区域单击目录进入、双击文件选中，顶部按钮可上传 / 下载 / 新建 / 删除 / 重命名。");
+    ui.weak("提示：终端区域点击后可输入命令（支持 vim / top / htop 等全屏程序）；文件区域单击目录进入、双击文件用默认编辑器打开，顶部按钮可上传 / 下载 / 新建 / 删除 / 重命名。");
+}
+
+/// 远程文件表格（单栏 / 双栏共用）：名称/大小/修改时间/权限 + 单击/双击/右键。
+fn render_remote_table(
+    ui: &mut egui::Ui,
+    app: &mut SshApp,
+    idx: usize,
+    actions: &mut Vec<FilesAction>,
+    avail_h: f32,
+) {
+    egui::ScrollArea::vertical()
+        .auto_shrink([false, false])
+        .max_height(avail_h.max(40.0))
+        .show(ui, |ui| {
+            TableBuilder::new(ui)
+                .vscroll(false) // 关闭表格内部滚动，统一由外层 ScrollArea 提供垂直滚动条
+                .striped(true)
+                .sense(egui::Sense::click()) // 整行可交互：任意列右键都弹出菜单
+                .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
+                .column(Column::auto().at_least(220.0))
+                .column(Column::initial(110.0).at_least(70.0))
+                .column(Column::initial(150.0))
+                .column(Column::remainder())
+                .header(22.0, |mut h| {
+                    h.col(|ui| {
+                        ui.strong(RichText::new("名称").color(Color32::WHITE));
+                    });
+                    h.col(|ui| {
+                        ui.strong(RichText::new("大小").color(Color32::WHITE));
+                    });
+                    h.col(|ui| {
+                        ui.strong(RichText::new("修改时间").color(Color32::WHITE));
+                    });
+                    h.col(|ui| {
+                        ui.strong(RichText::new("权限").color(Color32::WHITE));
+                    });
+                })
+                .body(|mut body| {
+                    for entry in &app.sessions[idx].entries {
+                        let path = entry.path.clone();
+                        let is_dir = entry.is_dir;
+                        body.row(20.0, |mut row| {
+                            let selected =
+                                app.sessions[idx].selected.as_deref() == Some(path.as_str());
+                            let (r1, _) = row.col(|ui| {
+                                let color = if is_dir {
+                                    Color32::from_rgb(120, 180, 255)
+                                } else if selected {
+                                    Color32::from_rgb(210, 228, 255)
+                                } else {
+                                    ui.visuals().text_color()
+                                };
+                                // 矢量图标（替代 emoji，黑色主题下更清晰美观）
+                                let (icon_rect, _) =
+                                    ui.allocate_exact_size(egui::vec2(15.0, 13.0), egui::Sense::hover());
+                                paint_file_icon(
+                                    ui.painter(),
+                                    icon_rect,
+                                    is_dir,
+                                    entry.is_symlink,
+                                    selected,
+                                    false,
+                                );
+                                let hr = ui.horizontal(|ui| {
+                                    ui.label(RichText::new(&entry.name).color(color));
+                                });
+                                // 整行（图标+文本）可点击/双击（右键菜单在行级统一处理）
+                                let resp = ui.interact(
+                                    hr.response.rect,
+                                    ui.id().with(&path),
+                                    egui::Sense::click(),
+                                );
+                                if resp.double_clicked() {
+                                    if is_dir {
+                                        actions.push(FilesAction::Navigate(path.clone()));
+                                    } else {
+                                        // 双击文件：下载到临时目录后用默认编辑器打开
+                                        actions.push(FilesAction::OpenRemote(path.clone()));
+                                    }
+                                } else if resp.clicked() {
+                                    if is_dir {
+                                        actions.push(FilesAction::Navigate(path.clone()));
+                                    } else {
+                                        actions.push(FilesAction::Select(path.clone()));
+                                    }
+                                }
+                            });
+                            let (r2, _) = row.col(|ui| {
+                                if is_dir {
+                                    ui.weak("—");
+                                } else {
+                                    ui.label(entry.size.map(fmt_size).unwrap_or_else(|| "—".into()));
+                                }
+                            });
+                            let (r3, _) = row.col(|ui| {
+                                ui.weak(entry.mtime.clone().unwrap_or_default());
+                            });
+                            row.col(|ui| {
+                                ui.weak(entry.perms.clone().unwrap_or_default());
+                                // 整行 hover / 选中高亮：前三列 rect union + 当前权限列区域 = 整行
+                                let row_full = r1.union(r2).union(r3).union(ui.max_rect());
+                                let hovered = ui.rect_contains_pointer(row_full);
+                                if hovered || selected {
+                                    let bg = if selected {
+                                        Color32::from_rgba_unmultiplied(58, 88, 138, 120)
+                                    } else {
+                                        Color32::from_rgba_unmultiplied(82, 122, 182, 55)
+                                    };
+                                    ui.painter().rect_filled(row_full, 2.0, bg);
+                                }
+                                if hovered {
+                                    ui.output_mut(|o| o.cursor_icon = egui::CursorIcon::PointingHand);
+                                }
+                            });
+                            // 整行右键菜单：删除 / 下载（文件与文件夹均支持，文件夹递归处理）
+                            let menu_path = path.clone();
+                            let menu_is_dir = is_dir;
+                            row.response().context_menu(|ui| {
+                                if ui.button("⬇ 下载").clicked() {
+                                    actions.push(FilesAction::DownloadSel(menu_path.clone()));
+                                    ui.close_menu();
+                                }
+                                if ui
+                                    .button(RichText::new("🗑 删除").color(Color32::LIGHT_RED))
+                                    .clicked()
+                                {
+                                    app.dialog_old = menu_path.clone();
+                                    app.dialog = Some(DialogKind::ConfirmDelete);
+                                    ui.close_menu();
+                                }
+                                if menu_is_dir && ui.button("进入目录").clicked() {
+                                    actions.push(FilesAction::Navigate(menu_path));
+                                    ui.close_menu();
+                                }
+                            });
+                        });
+                    }
+                });
+        });
+}
+
+/// 本地面板：路径行（上级/刷新/输入）+ 文件列表（单击选中、双击进入目录）。
+fn render_local_table(ui: &mut egui::Ui, app: &mut SshApp, avail_h: f32) {
+    ui.horizontal(|ui| {
+        if ui
+            .add(egui::Button::new("⬆").small())
+            .on_hover_text("上级目录")
+            .clicked()
+        {
+            let p = PathBuf::from(&app.local_dir);
+            if let Some(parent) = p.parent() {
+                app.local_dir = parent.to_string_lossy().into_owned();
+                app.local_entries = load_local_entries(&app.local_dir);
+                app.local_selected = None;
+            }
+        }
+        if ui
+            .add(egui::Button::new("↻").small())
+            .on_hover_text("刷新")
+            .clicked()
+        {
+            app.local_entries = load_local_entries(&app.local_dir);
+        }
+        let resp =
+            ui.add(egui::TextEdit::singleline(&mut app.local_dir).desired_width(ui.available_width()));
+        if resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+            app.local_entries = load_local_entries(&app.local_dir);
+            app.local_selected = None;
+        }
+    });
+    let entries = app.local_entries.clone();
+    egui::ScrollArea::vertical()
+        .auto_shrink([false, false])
+        .max_height(avail_h.max(40.0))
+        .show(ui, |ui| {
+            TableBuilder::new(ui)
+                .vscroll(false)
+                .striped(true)
+                .sense(egui::Sense::click())
+                .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
+                .column(Column::auto().at_least(140.0))
+                .column(Column::initial(90.0))
+                .column(Column::remainder())
+                .header(22.0, |mut h| {
+                    h.col(|ui| {
+                        ui.strong(RichText::new("名称").color(Color32::WHITE));
+                    });
+                    h.col(|ui| {
+                        ui.strong(RichText::new("大小").color(Color32::WHITE));
+                    });
+                    h.col(|ui| {
+                        ui.strong(RichText::new("修改时间").color(Color32::WHITE));
+                    });
+                })
+                .body(|mut body| {
+                    for e in &entries {
+                        let path = e.path.clone();
+                        let is_dir = e.is_dir;
+                        let selected = app.local_selected.as_deref() == Some(path.as_str());
+                        body.row(20.0, |mut row| {
+                            let (r1, _) = row.col(|ui| {
+                                let color = if is_dir {
+                                    Color32::from_rgb(120, 180, 255)
+                                } else {
+                                    ui.visuals().text_color()
+                                };
+                                let (icon_rect, _) =
+                                    ui.allocate_exact_size(egui::vec2(15.0, 13.0), egui::Sense::hover());
+                                paint_file_icon(ui.painter(), icon_rect, is_dir, false, selected, false);
+                                let hr = ui.horizontal(|ui| {
+                                    ui.label(RichText::new(&e.name).color(color));
+                                });
+                                let resp = ui.interact(
+                                    hr.response.rect,
+                                    ui.id().with(&path),
+                                    egui::Sense::click(),
+                                );
+                                if resp.double_clicked() && is_dir {
+                                    app.local_dir = path.clone();
+                                    app.local_entries = load_local_entries(&app.local_dir);
+                                    app.local_selected = None;
+                                } else if resp.clicked() {
+                                    app.local_selected = Some(path.clone());
+                                }
+                            });
+                            let (r2, _) = row.col(|ui| {
+                                if is_dir {
+                                    ui.weak("—");
+                                } else {
+                                    ui.label(fmt_size(e.size));
+                                }
+                            });
+                            row.col(|ui| {
+                                ui.weak(&e.mtime);
+                                let row_full = r1.union(r2).union(ui.max_rect());
+                                let hovered = ui.rect_contains_pointer(row_full);
+                                if hovered || selected {
+                                    let bg = if selected {
+                                        Color32::from_rgba_unmultiplied(58, 88, 138, 120)
+                                    } else {
+                                        Color32::from_rgba_unmultiplied(82, 122, 182, 55)
+                                    };
+                                    ui.painter().rect_filled(row_full, 2.0, bg);
+                                }
+                            });
+                        });
+                    }
+                });
+        });
 }
 
 enum FilesAction {
@@ -3260,6 +3878,8 @@ enum FilesAction {
     Select(String),
     UploadLocal(PathBuf),
     DownloadSel(String),
+    /// 双击远程文件：下载到临时目录后用系统默认应用打开
+    OpenRemote(String),
 }
 
 // =====================================================================
@@ -3623,6 +4243,51 @@ fn fmt_size(n: u64) -> String {
 // 本地账号存储（exe 同目录 accounts.tsv，tab 分隔）
 // =====================================================================
 
+/// 本地面板默认目录（用户主目录）。
+fn home_dir_str() -> String {
+    #[cfg(target_os = "windows")]
+    {
+        std::env::var("USERPROFILE").unwrap_or_else(|_| "C:\\".to_string())
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        std::env::var("HOME").unwrap_or_else(|_| "/".to_string())
+    }
+}
+
+/// 读取本地目录列表（目录在前，名称升序）。
+fn load_local_entries(dir: &str) -> Vec<LocalEntry> {
+    let mut out = Vec::new();
+    if let Ok(rd) = std::fs::read_dir(dir) {
+        for e in rd.flatten() {
+            let name = e.file_name().to_string_lossy().into_owned();
+            let meta = e.metadata().ok();
+            let is_dir = meta.as_ref().map(|m| m.is_dir()).unwrap_or(false);
+            let size = meta.as_ref().map(|m| m.len()).unwrap_or(0);
+            let mtime = meta
+                .and_then(|m| m.modified().ok())
+                .map(|t| {
+                    let dt: chrono::DateTime<chrono::Local> = t.into();
+                    dt.format("%Y-%m-%d %H:%M").to_string()
+                })
+                .unwrap_or_default();
+            out.push(LocalEntry {
+                name,
+                path: e.path().to_string_lossy().into_owned(),
+                is_dir,
+                size,
+                mtime,
+            });
+        }
+    }
+    out.sort_by(|a, b| {
+        b.is_dir
+            .cmp(&a.is_dir)
+            .then(a.name.to_lowercase().cmp(&b.name.to_lowercase()))
+    });
+    out
+}
+
 /// 一条已保存的远程账号。
 #[derive(Clone)]
 struct SavedAccount {
@@ -3632,6 +4297,19 @@ struct SavedAccount {
     user: String,
     password: Option<String>,
     key: Option<String>,
+    /// 分组名（如「生产环境」「开发测试」）；空串 = 未分组。
+    group: String,
+}
+
+/// 最近会话（最近连接的服务器 + 最后一条命令，用于快速重连）。
+#[derive(Clone)]
+struct RecentSession {
+    name: String,
+    host: String,
+    port: u16,
+    user: String,
+    cmd: String,
+    when: String,
 }
 
 /// 账号文件路径：exe 同目录 accounts.tsv。
@@ -3643,7 +4321,7 @@ fn accounts_path() -> PathBuf {
         .join("accounts.tsv")
 }
 
-/// 序列化为 TSV 文本（字段：name\thost\tport\tuser\tpassword\tkey）。
+/// 序列化为 TSV 文本（字段：name\thost\tport\tuser\tpassword\tkey\tgroup）。
 fn serialize_accounts(accounts: &[SavedAccount]) -> String {
     let mut s = String::new();
     for a in accounts {
@@ -3658,6 +4336,8 @@ fn serialize_accounts(accounts: &[SavedAccount]) -> String {
         s.push_str(a.password.as_deref().unwrap_or(""));
         s.push('\t');
         s.push_str(a.key.as_deref().unwrap_or(""));
+        s.push('\t');
+        s.push_str(&a.group);
         s.push('\n');
     }
     s
@@ -3692,6 +4372,7 @@ fn parse_accounts(text: &str) -> Vec<SavedAccount> {
         }
         let password = f.next().map(|s| s.to_string()).filter(|s| !s.is_empty());
         let key = f.next().map(|s| s.to_string()).filter(|s| !s.is_empty());
+        let group = f.next().map(|s| s.to_string()).unwrap_or_default();
         out.push(SavedAccount {
             name: if name.is_empty() {
                 format!("{user}@{host}")
@@ -3703,6 +4384,7 @@ fn parse_accounts(text: &str) -> Vec<SavedAccount> {
             user,
             password,
             key,
+            group,
         });
     }
     out
@@ -3717,6 +4399,96 @@ fn load_accounts() -> Vec<SavedAccount> {
 
 fn save_accounts(accounts: &[SavedAccount]) {
     let _ = std::fs::write(accounts_path(), serialize_accounts(accounts));
+}
+
+/// 最近会话文件路径：exe 同目录 recent.tsv。
+fn recent_path() -> PathBuf {
+    std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(|d| d.to_path_buf()))
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join("recent.tsv")
+}
+
+/// 最近会话序列化（字段：name\thost\tport\tuser\tcmd\twhen）。
+fn serialize_recent(recent: &[RecentSession]) -> String {
+    let mut s = String::new();
+    for r in recent {
+        s.push_str(&r.name);
+        s.push('\t');
+        s.push_str(&r.host);
+        s.push('\t');
+        s.push_str(&r.port.to_string());
+        s.push('\t');
+        s.push_str(&r.user);
+        s.push('\t');
+        s.push_str(&r.cmd);
+        s.push('\t');
+        s.push_str(&r.when);
+        s.push('\n');
+    }
+    s
+}
+
+fn parse_recent(text: &str) -> Vec<RecentSession> {
+    let mut out = Vec::new();
+    for line in text.lines() {
+        let mut f = line.split('\t');
+        let name = match f.next() {
+            Some(n) if !n.is_empty() => n.to_string(),
+            _ => continue,
+        };
+        let host = match f.next() {
+            Some(h) if !h.is_empty() => h.to_string(),
+            _ => continue,
+        };
+        let port: u16 = match f.next() {
+            Some(p) => match p.parse() {
+                Ok(v) => v,
+                Err(_) => continue,
+            },
+            None => continue,
+        };
+        let user = match f.next() {
+            Some(u) if !u.is_empty() => u.to_string(),
+            _ => continue,
+        };
+        let cmd = f.next().map(|s| s.to_string()).unwrap_or_default();
+        let when = f.next().map(|s| s.to_string()).unwrap_or_default();
+        out.push(RecentSession {
+            name,
+            host,
+            port,
+            user,
+            cmd,
+            when,
+        });
+    }
+    out
+}
+
+fn load_recent() -> Vec<RecentSession> {
+    match std::fs::read_to_string(recent_path()) {
+        Ok(text) => parse_recent(&text),
+        Err(_) => Vec::new(),
+    }
+}
+
+fn save_recent(recent: &[RecentSession]) {
+    let _ = std::fs::write(recent_path(), serialize_recent(recent));
+}
+
+/// 以 host+port+user 为主键更新最近会话（最新在前，最多保留 12 条）。
+fn upsert_recent(recent: &mut Vec<RecentSession>, mut r: RecentSession) {
+    recent.retain(|x| !(x.host == r.host && x.port == r.port && x.user == r.user));
+    let mut now = now_hms();
+    if now.len() >= 5 {
+        now = format!("今天 {now}");
+    }
+    r.when = now;
+    recent.insert(0, r);
+    recent.truncate(12);
+    save_recent(recent);
 }
 
 /// 以 host+port+user 为主键去重插入/覆盖。
@@ -3948,6 +4720,7 @@ mod tests {
                 user: "root".into(),
                 password: Some("secret".into()),
                 key: None,
+                group: "生产环境".into(),
             },
             SavedAccount {
                 name: "dev@example.com".into(),
@@ -3956,6 +4729,7 @@ mod tests {
                 user: "dev".into(),
                 password: None,
                 key: Some("C:\\keys\\id_ed25519".into()),
+                group: String::new(),
             },
         ];
         let text = serialize_accounts(&accounts);
@@ -3986,17 +4760,17 @@ mod tests {
         let mut accounts = Vec::new();
         upsert_account(
             &mut accounts,
-            SavedAccount { name: "a@h".into(), host: "h".into(), port: 22, user: "a".into(), password: Some("p1".into()), key: None },
+            SavedAccount { name: "a@h".into(), host: "h".into(), port: 22, user: "a".into(), password: Some("p1".into()), key: None, group: String::new() },
         );
         upsert_account(
             &mut accounts,
-            SavedAccount { name: "b@h".into(), host: "h".into(), port: 22, user: "b".into(), password: None, key: None },
+            SavedAccount { name: "b@h".into(), host: "h".into(), port: 22, user: "b".into(), password: None, key: None, group: String::new() },
         );
         assert_eq!(accounts.len(), 2);
         // 同 host+port+user 覆盖
         upsert_account(
             &mut accounts,
-            SavedAccount { name: "a@h".into(), host: "h".into(), port: 22, user: "a".into(), password: Some("p2".into()), key: None },
+            SavedAccount { name: "a@h".into(), host: "h".into(), port: 22, user: "a".into(), password: Some("p2".into()), key: None, group: String::new() },
         );
         assert_eq!(accounts.len(), 2);
         assert_eq!(accounts[0].password.as_deref(), Some("p2"));
