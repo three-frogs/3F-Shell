@@ -329,6 +329,10 @@ struct ConnTab {
     manual_disconnect: bool,
     reconnect_attempts: u32,
     ping_timer: f64,
+    /// 最近一次 ping 发出的时刻（用于计算 RTT 延迟）
+    ping_sent_at: Option<std::time::Instant>,
+    /// 最近一次 ping 往返延迟（毫秒）
+    ping_ms: Option<u64>,
     sysinfo_timer: f64,
     /// 用户是否手动在文件面板打开过路径（此后停止终端路径自动联动）
     user_navigated: bool,
@@ -362,6 +366,8 @@ impl ConnTab {
             manual_disconnect: false,
             reconnect_attempts: 0,
             ping_timer: 0.0,
+            ping_sent_at: None,
+            ping_ms: None,
             sysinfo_timer: 0.0,
             user_navigated: false,
             sync_timer: 0.0,
@@ -1143,7 +1149,12 @@ impl SshApp {
             BackInner::SysInfo(Err(e)) => {
                 self.sessions[idx].status = format!("获取系统信息失败：{e}");
             }
-            BackInner::Ping(Ok(())) => {}
+            BackInner::Ping(Ok(())) => {
+                // 计算往返延迟（毫秒），供底部状态栏显示
+                if let Some(t0) = self.sessions[idx].ping_sent_at.take() {
+                    self.sessions[idx].ping_ms = Some(t0.elapsed().as_millis() as u64);
+                }
+            }
             BackInner::Ping(Err(_)) => {} // 已在 pump 主循环按自动重连处理
         }
     }
@@ -1267,6 +1278,8 @@ impl eframe::App for SshApp {
                     let id = self.sessions[idx].id.clone();
                     self.send(FsMsg::For { id, msg: FsInner::Ping });
                     self.sessions[idx].ping_timer = 0.0;
+                    // 记录发出时刻，收到 Ok 后计算往返延迟
+                    self.sessions[idx].ping_sent_at = Some(std::time::Instant::now());
                 } else {
                     self.sessions[idx].ping_timer = ping + dt;
                 }
@@ -1852,7 +1865,8 @@ fn left_panel(ui: &mut egui::Ui, app: &mut SshApp) {
                     ui.horizontal(|ui| {
                         ui.weak(format!("{k}:"));
                         if let Some(pct) = metric_pct(v) {
-                            let warn = pct >= 80.0;
+                            // 预警阈值对齐设计稿：使用率达到 40% 即提示
+                            let warn = pct >= 40.0;
                             ui.add(
                                 egui::ProgressBar::new(pct / 100.0)
                                     .desired_width(160.0)
@@ -1866,7 +1880,7 @@ fn left_panel(ui: &mut egui::Ui, app: &mut SshApp) {
                             if warn {
                                 ui.colored_label(
                                     Color32::from_rgb(255, 110, 110),
-                                    "⚠ 超预警阈值 80%",
+                                    "⚠ 超预警阈值 40%",
                                 );
                             }
                         }
@@ -1946,6 +1960,14 @@ fn status_bar(ui: &mut egui::Ui, app: &mut SshApp) {
         match conn {
             Some(s) => {
                 ui.colored_label(Color32::from_rgb(120, 200, 120), s);
+                // 对齐设计稿：连接状态下显示 ping 往返延迟
+                if let Some(ms) = app
+                    .sessions
+                    .get(app.active_idx())
+                    .and_then(|t| t.ping_ms)
+                {
+                    ui.weak(format!("延迟 {ms}ms"));
+                }
             }
             None => {
                 ui.colored_label(Color32::GRAY, "未连接");
@@ -2280,9 +2302,16 @@ fn transfer_panel_content(ui: &mut egui::Ui, app: &mut SshApp) {
             let up = app.active_transfer == Some(true);
             let pct = (done.min(total) as f32 / total as f32).clamp(0.0, 1.0);
             let dir_icon = if up { "⬆" } else { "⬇" };
+            // 动态统计进行中的任务数（对齐设计稿：传输队列 N 个任务）
+            let active_cnt = app
+                .transfer_log
+                .iter()
+                .filter(|r| !r.ok && r.detail == "进行中...")
+                .count()
+                .max(1);
             ui.horizontal(|ui| {
                 ui.strong(
-                    RichText::new(format!("{dir_icon} 传输队列  1 个任务")).color(black),
+                    RichText::new(format!("{dir_icon} 传输队列  {active_cnt} 个任务")).color(black),
                 );
                 if app.cur_rate > 0.0 {
                     ui.label(
@@ -3448,14 +3477,14 @@ fn files_panel(ui: &mut egui::Ui, app: &mut SshApp) {
         }
     }
     if app.show_dual {
-        // ===== 双栏传输模式：远程列表 | 传输按钮 | 本地列表 =====
+        // ===== 双栏传输模式：本地面板 | 传输按钮 | 远程列表（对齐设计稿：本地在左、远程在右） =====
         let list_h = (ui.available_height() - 36.0).max(60.0);
         ui.horizontal(|ui| {
-            // 左列：远程文件
+            // 左列：本地面板
             ui.vertical(|ui| {
                 ui.set_width((ui.available_width() * 0.40).max(190.0));
-                ui.strong(RichText::new("远程").color(Color32::WHITE));
-                render_remote_table(ui, app, idx, &mut actions, list_h);
+                ui.strong(RichText::new("本地").color(Color32::WHITE));
+                render_local_table(ui, app, list_h);
             });
             // 中列：传输按钮（本地选中 → 上传；远程选中 → 下载）
             ui.vertical_centered(|ui| {
@@ -3516,10 +3545,16 @@ fn files_panel(ui: &mut egui::Ui, app: &mut SshApp) {
                     }
                 }
             });
-            // 右列：本地面板
+            // 右列：远程文件（标题对齐设计稿：会话名 : 远程路径）
             ui.vertical(|ui| {
                 ui.set_width(ui.available_width());
-                render_local_table(ui, app, list_h);
+                let sess_txt = app
+                    .sessions
+                    .get(idx)
+                    .map(|t| format!("{} : {}", t.account.name, t.cwd))
+                    .unwrap_or_else(|| "远程".to_string());
+                ui.strong(RichText::new(sess_txt).color(Color32::WHITE));
+                render_remote_table(ui, app, idx, &mut actions, list_h);
             });
         });
         ui.add_space(2.0);
