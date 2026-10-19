@@ -1725,7 +1725,7 @@ fn left_panel(ui: &mut egui::Ui, app: &mut SshApp) {
     let mut remove_idx: Option<usize> = None;
     let mut to_connect: Option<SavedAccount> = None;
     // 服务器列表占左侧栏约一半高度，超出部分用滚动条查看（下半区为系统信息）
-    let list_h = (ui.available_height() * 0.42).max(80.0);
+    let list_h = (ui.available_height() * 0.36).max(60.0);
     egui::ScrollArea::vertical()
         .max_height(list_h)
         .auto_shrink([false, false])
@@ -1813,10 +1813,12 @@ fn left_panel(ui: &mut egui::Ui, app: &mut SshApp) {
     }
     // 系统信息区：与上方服务器列表各占一半固定高度（可独立滚动）
     ui.separator();
-    let sys_h = (ui.available_height() * 0.55).max(120.0);
+    // 系统信息区：占满左侧栏剩余全部高度，内容超出时始终显示滚动条
+    let sys_h = ui.available_height();
     egui::ScrollArea::vertical()
         .max_height(sys_h)
         .auto_shrink([false, false])
+        .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysVisible)
         .show(ui, |ui| {
             system_info_block(ui, app);
         });
@@ -3631,28 +3633,26 @@ fn files_panel(ui: &mut egui::Ui, app: &mut SshApp) {
         }
     });
         // 右列：传输队列（高度跟随文件区域）
-        let queue_left: Option<f32> = if app.show_transfer {
-            let qx = ui.cursor().min.x;
+        if app.show_transfer {
             ui.add_space(8.0);
             ui.vertical(|ui| {
                 ui.set_width(240.0);
                 transfer_panel_content(ui, app);
             });
-            Some(qx)
-        } else {
-            None
-        };
-        // 分隔线：队列与文件区域之间（最后绘制确保不被覆盖，颜色加深为可见灰蓝）
-        if let Some(qx) = queue_left {
-            let sep_y0 = ui.max_rect().top();
-            let sep_y1 = ui.max_rect().bottom();
-            ui.painter().vline(
-                qx - 4.0,
-                egui::Rangef::new(sep_y0, sep_y1),
-                egui::Stroke::new(1.0_f32, Color32::from_rgb(203, 213, 225)),
-            );
         }
     });
+
+    // 分隔线：文件操作区与传输队列之间，固定贯穿文件区全高绘制（不依赖内容高度）
+    if app.show_transfer {
+        let rect = ui.max_rect();
+        let sep_x = rect.right() - 248.0; // 队列列（240 宽）左侧固定位置
+        let sep_y0 = rect.top() + 62.0; // 工具栏 / 路径行下方
+        ui.painter().vline(
+            sep_x,
+            egui::Rangef::new(sep_y0, rect.bottom()),
+            egui::Stroke::new(1.0_f32, Color32::from_rgb(148, 163, 184)),
+        );
+    }
 }
 
 /// 远程文件表格（单栏 / 双栏共用）：名称/大小/修改时间/权限 + 单击/双击/右键。
