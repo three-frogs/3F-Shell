@@ -305,6 +305,9 @@ enum DialogKind {
     Rename,
     ConfirmDelete,
     NewAccount,
+    Groups,      // 分组管理（列表 + 新建 + 重命名 + 删除）
+    RenameGroup, // 重命名分组（dialog_old = 旧组名）
+    MoveGroup,   // 将账号移动到分组（dialog_move_idx = 账号下标）
 }
 
 // =====================================================================
@@ -411,6 +414,10 @@ struct SshApp {
     last_focused: bool,
     dialog_input: String,
     dialog_old: String,
+    /// 分组维护列表（有序，不含「未分组」）；持久化到 groups.tsv。
+    groups: Vec<String>,
+    /// 「移动到分组」弹窗的目标账号下标。
+    dialog_move_idx: Option<usize>,
     // 传输明细记录（上传 / 下载）
     transfer_log: Vec<TransferRec>,
     show_transfer: bool,
@@ -657,6 +664,7 @@ impl SshApp {
         // SSH 窗口持续回收，避免数据通道拥塞导致 Ctrl+C（0x03）排不上队
         let (back_tx, back_rx) = mpsc::channel::<BackMsg>();
         spawn_backend(fs_rx, back_tx);
+        let accounts0 = load_accounts();
         Self {
             host: String::new(),
             port: "22".into(),
@@ -665,7 +673,7 @@ impl SshApp {
             key_path: None,
             remember_pwd: true,
             new_group: String::new(),
-            accounts: load_accounts(),
+            accounts: accounts0.clone(),
             search: String::new(),
             recent: load_recent(),
             sessions: Vec::new(),
@@ -677,6 +685,8 @@ impl SshApp {
             last_focused: false,
             dialog_input: String::new(),
             dialog_old: String::new(),
+            groups: merged_groups(&accounts0),
+            dialog_move_idx: None,
             transfer_log: load_transfers(),
             show_transfer: true,
             active_transfer: None,
@@ -1406,6 +1416,9 @@ impl eframe::App for SshApp {
                 DialogKind::Rename => "重命名",
                 DialogKind::ConfirmDelete => "确认删除",
                 DialogKind::NewAccount => "新增账号",
+                DialogKind::Groups => "分组管理",
+                DialogKind::RenameGroup => "重命名分组",
+                DialogKind::MoveGroup => "移动到分组",
             };
             let mut open = true;
             egui::Window::new(title)
@@ -1565,6 +1578,12 @@ impl eframe::App for SshApp {
                                             group: self.new_group.trim().to_string(),
                                         },
                                     );
+                                    // 同步登记新分组到分组列表（持久化 groups.tsv）
+                                    let ng = self.new_group.trim().to_string();
+                                    if !ng.is_empty() && !self.groups.contains(&ng) {
+                                        self.groups.push(ng);
+                                        save_groups(&self.groups);
+                                    }
                                     save_accounts(&self.accounts);
                                     self.dialog = None;
                                     self.status_set("账号已保存到本地，点击左侧账号即可连接");
@@ -1574,6 +1593,165 @@ impl eframe::App for SshApp {
                                 self.dialog = None;
                             }
                         });
+                    }
+                    DialogKind::Groups => {
+                        // 顶部：输入框 + 添加分组
+                        ui.horizontal(|ui| {
+                            ui.add(
+                                egui::TextEdit::singleline(&mut self.dialog_input)
+                                    .desired_width(180.0)
+                                    .hint_text("新分组名称"),
+                            );
+                            if ui.button("添加").clicked() {
+                                let name = self.dialog_input.trim().to_string();
+                                if !name.is_empty() && !self.groups.contains(&name) {
+                                    self.groups.push(name);
+                                    save_groups(&self.groups);
+                                    self.dialog_input.clear();
+                                    self.status_set("分组已创建");
+                                } else if !name.is_empty() {
+                                    self.status_set("分组已存在");
+                                }
+                            }
+                        });
+                        ui.add_space(4.0);
+                        ui.separator();
+                        if self.groups.is_empty() {
+                            ui.weak("暂无分组，输入名称添加");
+                        }
+                        // 分组列表：每行 [组名] [✎ 重命名] [× 删除]
+                        let mut del_group: Option<String> = None;
+                        let mut rename_group: Option<String> = None;
+                        egui::ScrollArea::vertical()
+                            .max_height(220.0)
+                            .auto_shrink([false, false])
+                            .show(ui, |ui| {
+                                for g in &self.groups.clone() {
+                                    let n = self
+                                        .accounts
+                                        .iter()
+                                        .filter(|a| a.group == *g)
+                                        .count();
+                                    ui.horizontal(|ui| {
+                                        ui.strong(RichText::new(g).color(Color32::from_rgb(31, 41, 55)));
+                                        ui.weak(format!("{n} 台"));
+                                        if ui.small_button("✎").on_hover_text("重命名分组").clicked() {
+                                            rename_group = Some(g.clone());
+                                        }
+                                        if ui
+                                            .small_button("×")
+                                            .on_hover_text("删除分组（组内服务器移至未分组）")
+                                            .clicked()
+                                        {
+                                            del_group = Some(g.clone());
+                                        }
+                                    });
+                                    ui.separator();
+                                }
+                            });
+                        if let Some(g) = rename_group {
+                            self.dialog_old = g;
+                            self.dialog_input = self.dialog_old.clone();
+                            self.dialog = Some(DialogKind::RenameGroup);
+                        }
+                        if let Some(g) = del_group {
+                            let mut changed = false;
+                            for a in self.accounts.iter_mut() {
+                                if a.group == g {
+                                    a.group.clear();
+                                    changed = true;
+                                }
+                            }
+                            self.groups.retain(|x| *x != g);
+                            save_groups(&self.groups);
+                            if changed {
+                                save_accounts(&self.accounts);
+                            }
+                            self.status_set(format!("分组「{g}」已删除，服务器移至未分组"));
+                        }
+                        ui.add_space(4.0);
+                        ui.horizontal(|ui| {
+                            if ui.button("关闭").clicked() {
+                                self.dialog = None;
+                            }
+                        });
+                    }
+                    DialogKind::RenameGroup => {
+                        let old = self.dialog_old.clone();
+                        ui.label(format!("将分组「{old}」重命名为："));
+                        ui.add(egui::TextEdit::singleline(&mut self.dialog_input).desired_width(220.0));
+                        ui.add_space(6.0);
+                        ui.horizontal(|ui| {
+                            if ui.button("确定").clicked() {
+                                let new_name = self.dialog_input.trim().to_string();
+                                if new_name.is_empty() {
+                                    self.status_set("分组名不能为空");
+                                } else if self
+                                    .groups
+                                    .iter()
+                                    .any(|x| *x == new_name && *x != old)
+                                {
+                                    self.status_set("分组名已存在");
+                                } else {
+                                    let mut changed = false;
+                                    for a in self.accounts.iter_mut() {
+                                        if a.group == old {
+                                            a.group = new_name.clone();
+                                            changed = true;
+                                        }
+                                    }
+                                    if let Some(slot) = self.groups.iter_mut().find(|x| **x == old) {
+                                        *slot = new_name.clone();
+                                    }
+                                    save_groups(&self.groups);
+                                    if changed {
+                                        save_accounts(&self.accounts);
+                                    }
+                                    self.dialog = None;
+                                    self.status_set("分组已重命名");
+                                }
+                            }
+                            if ui.button("取消").clicked() {
+                                self.dialog = None;
+                            }
+                        });
+                    }
+                    DialogKind::MoveGroup => {
+                        let idx = self.dialog_move_idx;
+                        let acc_name = idx
+                            .and_then(|i| self.accounts.get(i))
+                            .map(|a| format!("{} ({})", a.name, a.host))
+                            .unwrap_or_default();
+                        ui.label(format!("将「{acc_name}」移动到分组："));
+                        ui.add_space(4.0);
+                        // 「未分组」+ 全部分组
+                        let mut target: Option<String> = None;
+                        let cur = idx.and_then(|i| self.accounts.get(i)).map(|a| a.group.clone());
+                        if ui
+                            .selectable_label(cur.as_deref() == Some(""), "未分组")
+                            .clicked()
+                        {
+                            target = Some(String::new());
+                        }
+                        for g in &self.groups {
+                            if ui.selectable_label(cur.as_deref() == Some(g), g).clicked() {
+                                target = Some(g.clone());
+                            }
+                        }
+                        if let Some(t) = target {
+                            if let Some(i) = idx {
+                                if i < self.accounts.len() {
+                                    self.accounts[i].group = t;
+                                    save_accounts(&self.accounts);
+                                    self.status_set("已移动到分组");
+                                }
+                            }
+                            self.dialog = None;
+                        }
+                        ui.add_space(6.0);
+                        if ui.button("取消").clicked() {
+                            self.dialog = None;
+                        }
                     }
                 });
             if !open {
@@ -1726,6 +1904,14 @@ fn left_panel(ui: &mut egui::Ui, app: &mut SshApp) {
             app.dialog_input.clear();
             app.dialog = Some(DialogKind::NewAccount);
         }
+        if ui
+            .small_button("分组")
+            .on_hover_text("分组管理：新建 / 重命名 / 删除分组")
+            .clicked()
+        {
+            app.dialog_input.clear();
+            app.dialog = Some(DialogKind::Groups);
+        }
     });
     ui.add(
         egui::TextEdit::singleline(&mut app.search)
@@ -1739,6 +1925,8 @@ fn left_panel(ui: &mut egui::Ui, app: &mut SshApp) {
     let kw = app.search.trim().to_lowercase();
     let mut remove_idx: Option<usize> = None;
     let mut to_connect: Option<SavedAccount> = None;
+    let mut rename_group: Option<String> = None; // 分组重命名（非空分组）
+    let mut del_group: Option<String> = None;    // 分组删除（非空分组）
     // 服务器列表占左侧栏约一半高度，超出部分用滚动条查看（下半区为系统信息）
     let list_h = (ui.available_height() * 0.36).max(60.0);
     egui::ScrollArea::vertical()
@@ -1770,11 +1958,34 @@ fn left_panel(ui: &mut egui::Ui, app: &mut SshApp) {
                     continue;
                 }
                 let gname = if g.is_empty() { "未分组" } else { g.as_str() };
-                ui.weak(RichText::new(format!("▸ {gname}")).small());
+                if g.is_empty() {
+                    ui.weak(RichText::new(format!("▸ {gname}")).small());
+                } else {
+                    // 命名分组：右侧提供「重命名 / 删除」维护入口
+                    ui.horizontal(|ui| {
+                        ui.weak(RichText::new(format!("▸ {gname}")).small());
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if ui
+                                .small_button("×")
+                                .on_hover_text("删除分组（组内服务器移至未分组）")
+                                .clicked()
+                            {
+                                del_group = Some(g.clone());
+                            }
+                            if ui
+                                .small_button("✏")
+                                .on_hover_text("重命名分组")
+                                .clicked()
+                            {
+                                rename_group = Some(g.clone());
+                            }
+                        });
+                    });
+                }
                 for (i, a) in members {
                     shown += 1;
                     let label0 = format!("{}  {}", a.name, a.host);
-                    let btn_w = (ui.available_width() - 26.0).max(70.0);
+                    let btn_w = (ui.available_width() - 46.0).max(70.0);
                     let max_cw = ((btn_w / 7.4) as usize).max(6); // 13px 字体半角字符宽约 7.4px
                     let label = truncate_wide(&label0, max_cw);
                     let active = app.sessions.iter().any(|t| {
@@ -1791,7 +2002,15 @@ fn left_panel(ui: &mut egui::Ui, app: &mut SshApp) {
                     let mut del = false;
                     ui.horizontal(|ui| {
                         clicked = ui.add_sized([btn_w, 18.0], btn).clicked();
-                        del = ui.small_button("×").clicked();
+                        del = ui.small_button("×").on_hover_text("删除该账号").clicked();
+                        if ui
+                            .small_button("→")
+                            .on_hover_text("移动到分组")
+                            .clicked()
+                        {
+                            app.dialog_move_idx = Some(i);
+                            app.dialog = Some(DialogKind::MoveGroup);
+                        }
                     });
                     if clicked {
                         to_connect = Some(a.clone());
@@ -1825,6 +2044,26 @@ fn left_panel(ui: &mut egui::Ui, app: &mut SshApp) {
         app.accounts.remove(i);
         save_accounts(&app.accounts);
         app.status_set("账号已删除");
+    }
+    if let Some(g) = rename_group {
+        app.dialog_old = g;
+        app.dialog_input = app.dialog_old.clone();
+        app.dialog = Some(DialogKind::RenameGroup);
+    }
+    if let Some(g) = del_group {
+        let mut changed = false;
+        for a in app.accounts.iter_mut() {
+            if a.group == g {
+                a.group.clear();
+                changed = true;
+            }
+        }
+        app.groups.retain(|x| *x != g);
+        save_groups(&app.groups);
+        if changed {
+            save_accounts(&app.accounts);
+        }
+        app.status_set(format!("分组「{g}」已删除，服务器移至未分组"));
     }
     // 系统信息区：与上方服务器列表各占一半固定高度（可独立滚动）
     ui.separator();
@@ -4532,6 +4771,48 @@ fn accounts_path() -> PathBuf {
         .and_then(|p| p.parent().map(|d| d.to_path_buf()))
         .unwrap_or_else(|| PathBuf::from("."))
         .join("accounts.tsv")
+}
+
+/// 分组文件路径：exe 同目录 groups.tsv（每行一个分组名，不含「未分组」）。
+fn groups_path() -> PathBuf {
+    std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(|d| d.to_path_buf()))
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join("groups.tsv")
+}
+
+/// 加载分组列表（跳过空行）。
+fn load_groups() -> Vec<String> {
+    match std::fs::read_to_string(groups_path()) {
+        Ok(text) => text
+            .lines()
+            .map(|l| l.trim().to_string())
+            .filter(|l| !l.is_empty())
+            .collect(),
+        Err(_) => Vec::new(),
+    }
+}
+
+/// 保存分组列表（每行一个，UTF-8）。
+fn save_groups(groups: &[String]) {
+    let mut s = String::new();
+    for g in groups {
+        s.push_str(g);
+        s.push('\n');
+    }
+    let _ = std::fs::write(groups_path(), s);
+}
+
+/// 分组列表 = 持久化 groups.tsv ∪ 账号中出现的全部分组（保持出现顺序，兼容旧数据）。
+fn merged_groups(accounts: &[SavedAccount]) -> Vec<String> {
+    let mut out = load_groups();
+    for a in accounts {
+        if !a.group.is_empty() && !out.contains(&a.group) {
+            out.push(a.group.clone());
+        }
+    }
+    out
 }
 
 /// 序列化为 TSV 文本（字段：name\thost\tport\tuser\tpassword\tkey\tgroup）。
