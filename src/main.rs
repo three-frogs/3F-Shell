@@ -1248,6 +1248,11 @@ impl SshApp {
 }
 
 impl eframe::App for SshApp {
+    /// 窗口背景：统一浅色（eframe 默认返回半透明近黑，会在左侧栏下方等
+    /// 面板未覆盖区域露出黑色隔断）
+    fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
+        egui::Color32::from_rgb(242, 244, 247).to_normalized_gamma_f32()
+    }
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.pump();
 
@@ -1855,9 +1860,10 @@ fn system_info_block(ui: &mut egui::Ui, app: &mut SshApp) {
         match k.as_str() {
             // CPU / 内存 / 硬盘：柱状图 + 详细文本 + 超过预警阈值提示
             "CPU" | "内存" | "硬盘" => {
+                let pct = metric_pct(v);
                 ui.horizontal(|ui| {
                     ui.weak(format!("{k}:"));
-                    if let Some(pct) = metric_pct(v) {
+                    if let Some(pct) = pct {
                         // 预警阈值对齐设计稿：使用率达到 40% 即提示（设计稿 002：黄色预警）
                         let warn = pct >= 40.0;
                         let warn_color = Color32::from_rgb(217, 119, 6);
@@ -1871,11 +1877,14 @@ fn system_info_block(ui: &mut egui::Ui, app: &mut SshApp) {
                                 })
                                 .text(format!("{pct:.0}%")),
                         );
-                        if warn {
-                            ui.colored_label(warn_color, "⚠ 已超过预警阈值 40%");
-                        }
                     }
                 });
+                // 预警提示独立一行，保证完整显示（左侧栏固定 240px，行内放不下整句）
+                if let Some(pct) = pct {
+                    if pct >= 40.0 {
+                        ui.colored_label(Color32::from_rgb(217, 119, 6), "⚠ 已超过预警阈值 40%");
+                    }
+                }
                 ui.weak(v.clone());
             }
             _ => {
@@ -1938,7 +1947,13 @@ fn status_bar(ui: &mut egui::Ui, app: &mut SshApp) {
         // 左侧：当前连接状态
         let conn = app.sessions.get(app.active_idx()).map(|t| {
             if t.connected {
-                format!("已连接 {}@{}", t.account.user, t.account.name)
+                // name 可能已含 user@host（快速连接自动拆分），状态栏用 user@host 拼接避免重复
+                let u = if t.account.user.is_empty() {
+                    "root"
+                } else {
+                    t.account.user.as_str()
+                };
+                format!("已连接 {}@{}", u, t.account.host)
             } else if t.connecting {
                 format!("连接中... {}", t.account.name)
             } else {
