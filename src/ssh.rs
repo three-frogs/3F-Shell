@@ -690,13 +690,13 @@ fn format_perms(mode: Option<u32>) -> Option<String> {
     Some(s)
 }
 
-/// 将 Unix 时间戳格式化为本地时间字符串。
+/// 将 Unix 时间戳格式化为本地时间字符串（对齐设计稿：月-日 时:分）。
 fn fmt_unix_ts(ts: u32) -> String {
     let secs = i64::from(ts);
     let dt = chrono::DateTime::<chrono::Local>::from(
         SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(secs.max(0) as u64),
     );
-    dt.format("%Y-%m-%d %H:%M:%S").to_string()
+    dt.format("%m-%d %H:%M").to_string()
 }
 
 /// 解析 `@@标记` 分段的系统信息命令输出为键值对列表。

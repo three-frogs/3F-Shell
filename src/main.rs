@@ -677,7 +677,7 @@ impl SshApp {
             dialog_input: String::new(),
             dialog_old: String::new(),
             transfer_log: load_transfers(),
-            show_transfer: false,
+            show_transfer: true,
             active_transfer: None,
             show_files: true,
             files_h: None,
@@ -1596,7 +1596,7 @@ fn tab_bar(ui: &mut egui::Ui, app: &mut SshApp) {
         ui.strong(RichText::new("连接").color(Color32::from_rgb(31, 41, 55)));
         ui.separator();
         if app.sessions.is_empty() {
-            ui.weak("未打开任何连接：点击左侧账号或「＋ 新增」发起连接");
+            ui.weak("未打开任何连接：点击左侧账号或「新建」发起连接");
         } else {
             let mut switch: Option<usize> = None;
             let mut close: Option<usize> = None;
@@ -1725,7 +1725,7 @@ fn left_panel(ui: &mut egui::Ui, app: &mut SshApp) {
     // ---- 服务器 ----
     ui.horizontal(|ui| {
         ui.strong(RichText::new("服务器").color(Color32::from_rgb(31, 41, 55)));
-        if ui.small_button("＋ 新增").clicked() {
+        if ui.small_button("新建").clicked() {
             app.dialog_input.clear();
             app.dialog = Some(DialogKind::NewAccount);
         }
@@ -1737,7 +1737,7 @@ fn left_panel(ui: &mut egui::Ui, app: &mut SshApp) {
     );
     ui.separator();
     if app.accounts.is_empty() {
-        ui.weak("暂无账号，点「＋ 新增」添加");
+        ui.weak("暂无账号，点「新建」添加");
     }
     let kw = app.search.trim().to_lowercase();
     let mut remove_idx: Option<usize> = None;
@@ -1937,7 +1937,7 @@ fn status_bar(ui: &mut egui::Ui, app: &mut SshApp) {
         // 左侧：当前连接状态
         let conn = app.sessions.get(app.active_idx()).map(|t| {
             if t.connected {
-                format!("已连接 {} ({}:{})", t.account.name, t.account.host, t.account.port)
+                format!("已连接 {}@{}", t.account.user, t.account.name)
             } else if t.connecting {
                 format!("连接中... {}", t.account.name)
             } else {
@@ -3532,7 +3532,7 @@ fn files_panel(ui: &mut egui::Ui, app: &mut SshApp) {
             });
         });
         ui.add_space(2.0);
-        ui.weak("提示：选中文件后点击中间箭头传输，或把本地文件拖入窗口上传到远程当前目录");
+        ui.weak("选中文件后点击中间箭头，或直接拖拽到对侧面板传输");
     } else {
         // 单栏模式：远程文件表格
         let hint_h = ui.text_style_height(&egui::TextStyle::Small) + 4.0;
@@ -3544,7 +3544,7 @@ fn files_panel(ui: &mut egui::Ui, app: &mut SshApp) {
             (ui.available_height() - hint_h).max(40.0),
         );
         ui.add_space(2.0);
-        ui.weak("提示：终端区域点击后可输入命令（支持 vim / top / htop 等全屏程序）；文件区域单击目录进入、双击文件用默认编辑器打开，顶部按钮可上传 / 下载 / 新建 / 删除 / 重命名。");
+        ui.weak("双击用默认编辑器打开 · 支持拖拽文件到此处直接上传");
     }
     for a in actions {
         match a {
@@ -4277,7 +4277,7 @@ fn load_local_entries(dir: &str) -> Vec<LocalEntry> {
                 .and_then(|m| m.modified().ok())
                 .map(|t| {
                     let dt: chrono::DateTime<chrono::Local> = t.into();
-                    dt.format("%Y-%m-%d %H:%M").to_string()
+                    dt.format("%m-%d %H:%M").to_string()
                 })
                 .unwrap_or_default();
             out.push(LocalEntry {
