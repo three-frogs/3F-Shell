@@ -634,20 +634,20 @@ impl SshApp {
         style.spacing.interact_size.y = 20.0;
         cc.egui_ctx.set_style(style);
 
-        // 全局深色主题：黑底白字（左侧栏/终端/文件面板/弹窗统一）
-        let mut visuals = egui::Visuals::dark();
-        visuals.panel_fill = Color32::from_rgb(16, 16, 18); // 面板近黑
-        visuals.window_fill = Color32::from_rgb(24, 24, 28); // 弹窗深灰
-        visuals.override_text_color = Some(Color32::WHITE); // 所有文本默认白色（weak 文本也提亮）
-        visuals.widgets.noninteractive.fg_stroke = egui::Stroke::new(1.0_f32, Color32::from_gray(210));
-        visuals.widgets.inactive.fg_stroke = egui::Stroke::new(1.0_f32, Color32::from_gray(210));
-        visuals.widgets.hovered.fg_stroke = egui::Stroke::new(1.0_f32, Color32::WHITE);
-        visuals.widgets.active.fg_stroke = egui::Stroke::new(1.0_f32, Color32::WHITE);
-        visuals.widgets.noninteractive.bg_fill = Color32::from_rgb(30, 30, 34);
-        visuals.widgets.inactive.bg_fill = Color32::from_rgb(38, 38, 44);
-        visuals.widgets.hovered.bg_fill = Color32::from_rgb(52, 52, 60);
-        visuals.widgets.active.bg_fill = Color32::from_rgb(60, 60, 70);
-        visuals.selection.bg_fill = Color32::from_rgb(56, 96, 168);
+        // 全局浅色主题：对齐设计稿"白蓝管理后台"风格（终端区单独保持黑底白字）
+        let mut visuals = egui::Visuals::light();
+        visuals.panel_fill = Color32::from_rgb(247, 248, 250); // 面板浅灰
+        visuals.window_fill = Color32::from_rgb(255, 255, 255); // 弹窗纯白
+        visuals.override_text_color = Some(Color32::from_rgb(31, 41, 55)); // 正文深灰蓝
+        visuals.widgets.noninteractive.fg_stroke = egui::Stroke::new(1.0_f32, Color32::from_rgb(107, 114, 128));
+        visuals.widgets.inactive.fg_stroke = egui::Stroke::new(1.0_f32, Color32::from_rgb(55, 65, 81));
+        visuals.widgets.hovered.fg_stroke = egui::Stroke::new(1.0_f32, Color32::from_rgb(31, 41, 55));
+        visuals.widgets.active.fg_stroke = egui::Stroke::new(1.0_f32, Color32::from_rgb(37, 99, 235));
+        visuals.widgets.noninteractive.bg_fill = Color32::from_rgb(243, 244, 246);
+        visuals.widgets.inactive.bg_fill = Color32::from_rgb(255, 255, 255);
+        visuals.widgets.hovered.bg_fill = Color32::from_rgb(219, 234, 254); // 浅蓝 hover
+        visuals.widgets.active.bg_fill = Color32::from_rgb(191, 219, 254);
+        visuals.selection.bg_fill = Color32::from_rgb(59, 130, 246);
         visuals.selection.stroke = egui::Stroke::new(1.0_f32, Color32::WHITE);
         cc.egui_ctx.set_visuals(visuals);
 
@@ -1322,7 +1322,11 @@ impl eframe::App for SshApp {
         egui::SidePanel::left("left_panel")
             .resizable(true)
             .default_width(210.0)
-            .frame(compact_frame())
+            .frame(
+                egui::Frame::new()
+                    .fill(Color32::from_rgb(242, 244, 247))
+                    .inner_margin(egui::Margin::symmetric(6, 2)),
+            )
             .show(ctx, |ui| left_panel(ui, self));
 
         // 文件面板：高度完全由用户手动拖动分隔条控制（无拖动时保持不变）。
@@ -1333,7 +1337,11 @@ impl eframe::App for SshApp {
         if self.show_files {
             egui::TopBottomPanel::bottom("files_panel")
                 .exact_height(self.files_h.unwrap_or(360.0))
-                .frame(compact_frame())
+                .frame(
+                    egui::Frame::new()
+                        .fill(Color32::from_rgb(255, 255, 255))
+                        .inner_margin(egui::Margin::symmetric(6, 2)),
+                )
                 .show(ctx, |ui| files_panel(ui, self));
         } else {
             // 关闭时底部保留标签条（白纸黑字风格，浅色底 + 黑色字体），点击重新展开
@@ -1370,7 +1378,11 @@ impl eframe::App for SshApp {
 
         // 终端区域吃掉全部剩余空间，避免底部留白
         egui::CentralPanel::default()
-            .frame(compact_frame())
+            .frame(
+                egui::Frame::new()
+                    .fill(Color32::from_rgb(255, 255, 255))
+                    .inner_margin(egui::Margin::symmetric(6, 2)),
+            )
             .show(ctx, |ui| term_panel(ui, self));
 
         // 模态对话框
@@ -1564,7 +1576,7 @@ impl eframe::App for SshApp {
 fn tab_bar(ui: &mut egui::Ui, app: &mut SshApp) {
     ui.horizontal(|ui| {
         ui.add_space(2.0);
-        ui.strong(RichText::new("连接").color(Color32::WHITE));
+        ui.strong(RichText::new("连接").color(Color32::from_rgb(31, 41, 55)));
         ui.separator();
         if app.sessions.is_empty() {
             ui.weak("未打开任何连接：点击左侧账号或「＋ 新增」发起连接");
@@ -1603,21 +1615,21 @@ fn tab_bar(ui: &mut egui::Ui, app: &mut SshApp) {
                 };
                 let (label_c, bg, border) = if sel {
                     (
-                        Color32::WHITE,
-                        Color32::from_rgb(36, 66, 112),
-                        Color32::from_rgb(110, 170, 255),
+                        Color32::from_rgb(29, 78, 216),
+                        Color32::from_rgb(219, 234, 254),
+                        Color32::from_rgb(96, 165, 250),
                     )
                 } else if resp.hovered() {
                     (
-                        Color32::from_gray(235),
-                        Color32::from_rgb(56, 56, 62),
-                        Color32::from_rgb(86, 86, 94),
+                        Color32::from_rgb(31, 41, 55),
+                        Color32::from_rgb(243, 244, 246),
+                        Color32::from_rgb(209, 213, 219),
                     )
                 } else {
                     (
-                        Color32::from_gray(195),
-                        Color32::from_rgb(44, 44, 48),
-                        Color32::from_rgb(62, 62, 68),
+                        Color32::from_rgb(107, 114, 128),
+                        Color32::from_rgb(255, 255, 255),
+                        Color32::from_rgb(229, 231, 235),
                     )
                 };
                 let painter = ui.painter();
@@ -1662,7 +1674,7 @@ fn tab_bar(ui: &mut egui::Ui, app: &mut SshApp) {
                     if x_resp.hovered() {
                         Color32::WHITE
                     } else {
-                        Color32::from_gray(215)
+                        Color32::from_rgb(107, 114, 128)
                     },
                 );
                 if x_resp.clicked() {
@@ -1695,7 +1707,7 @@ fn tab_bar(ui: &mut egui::Ui, app: &mut SshApp) {
 fn left_panel(ui: &mut egui::Ui, app: &mut SshApp) {
     // ---- 服务器 ----
     ui.horizontal(|ui| {
-        ui.strong(RichText::new("服务器").color(Color32::WHITE));
+        ui.strong(RichText::new("服务器").color(Color32::from_rgb(31, 41, 55)));
         if ui.small_button("＋ 新增").clicked() {
             app.dialog_input.clear();
             app.dialog = Some(DialogKind::NewAccount);
@@ -1802,7 +1814,7 @@ fn left_panel(ui: &mut egui::Ui, app: &mut SshApp) {
     ui.add_space(6.0);
 
     // ---- 状态 ----
-    ui.strong(RichText::new("状态").color(Color32::WHITE));
+    ui.strong(RichText::new("状态").color(Color32::from_rgb(31, 41, 55)));
     ui.separator();
     // 断开连接栏最上面：展示当前连接标签页的名称与 IP（有连接时显示）
     let (connected, connecting, status_text, name_text) = if let Some(t) =
@@ -1822,7 +1834,7 @@ fn left_panel(ui: &mut egui::Ui, app: &mut SshApp) {
             ui.strong(
                 RichText::new(format!("{name} ({host}:{port})"))
                     .size(14.0)
-                    .color(Color32::WHITE),
+                    .color(Color32::from_rgb(31, 41, 55)),
             );
         }
         ui.add_space(2.0);
@@ -1835,19 +1847,19 @@ fn left_panel(ui: &mut egui::Ui, app: &mut SshApp) {
         }
         ui.add_space(2.0);
     }
-    // 断开连接栏前后的状态信息统一使用白色字体
+    // 断开连接栏前后的状态信息统一使用深色字体
     let (color, text) = if connected {
-        (Color32::WHITE, status_text)
+        (Color32::from_rgb(31, 41, 55), status_text)
     } else if connecting {
-        (Color32::WHITE, format!("正在连接... {status_text}"))
+        (Color32::from_rgb(31, 41, 55), format!("正在连接... {status_text}"))
     } else {
-        (Color32::GRAY, status_text)
+        (Color32::from_rgb(156, 163, 175), status_text)
     };
     ui.colored_label(color, text);
     ui.add_space(6.0);
 
     // ---- 系统信息 ----
-    ui.strong(RichText::new("系统信息").color(Color32::WHITE));
+    ui.strong(RichText::new("系统信息").color(Color32::from_rgb(31, 41, 55)));
     ui.separator();
     if connected {
         let sysinfo: Vec<(String, String)> = app
@@ -2010,16 +2022,20 @@ fn quick_connect_panel(ui: &mut egui::Ui, app: &mut SshApp) {
     let avail = ui.available_size();
     let (rect, _) = ui.allocate_exact_size(avail, egui::Sense::hover());
     let painter = ui.painter();
-    painter.rect_filled(rect, 0.0, Color32::from_rgb(12, 12, 14));
+    painter.rect_filled(rect, 0.0, Color32::from_rgb(255, 255, 255));
     let inner = rect.shrink2(egui::vec2(28.0, 18.0));
     let mut cui = ui.new_child(egui::UiBuilder::new().max_rect(inner));
 
     cui.add_space(4.0);
-    cui.heading(RichText::new("连接到服务器").size(22.0).color(Color32::WHITE));
+    cui.heading(
+        RichText::new("连接到服务器")
+            .size(22.0)
+            .color(Color32::from_rgb(31, 41, 55)),
+    );
     cui.add_space(4.0);
     cui.weak("输入主机地址快速连接，或从左侧选择已保存的服务器");
     cui.add_space(12.0);
-    cui.strong(RichText::new("快速连接").size(14.0).color(Color32::WHITE));
+    cui.strong(RichText::new("快速连接").size(14.0).color(Color32::from_rgb(31, 41, 55)));
     cui.add_space(4.0);
 
     egui::Grid::new("quick_grid")
@@ -2069,7 +2085,7 @@ fn quick_connect_panel(ui: &mut egui::Ui, app: &mut SshApp) {
     cui.add_space(4.0);
     cui.weak("支持 SSH 密钥 / 密码登录，密钥可从本机一键导入");
     cui.add_space(16.0);
-    cui.strong(RichText::new("最近会话").size(14.0).color(Color32::WHITE));
+    cui.strong(RichText::new("最近会话").size(14.0).color(Color32::from_rgb(31, 41, 55)));
     cui.add_space(4.0);
     if app.recent.is_empty() {
         cui.weak("暂无最近会话，连接一次后自动记录");
@@ -2130,13 +2146,13 @@ fn term_panel(ui: &mut egui::Ui, app: &mut SshApp) {
         .map(|t| (t.connected, t.shell_alive))
         .unwrap_or((false, false));
     ui.horizontal(|ui| {
-        ui.strong(RichText::new("远程终端").color(Color32::WHITE));
+        ui.strong(RichText::new("远程终端").color(Color32::from_rgb(31, 41, 55)));
         if connected && shell_alive {
-            ui.colored_label(Color32::GREEN, "● 已连接");
+            ui.colored_label(Color32::from_rgb(22, 101, 52), "● 已连接");
         } else if connected {
-            ui.colored_label(Color32::YELLOW, "● shell 已退出");
+            ui.colored_label(Color32::from_rgb(180, 83, 9), "● shell 已退出");
         } else {
-            ui.colored_label(Color32::GRAY, "未连接");
+            ui.colored_label(Color32::from_rgb(107, 114, 128), "未连接");
         }
         // 右上角：文件面板开关 + 传输记录图标（点击在图标下方展开明细面板）
         let mut icon_rect: Option<egui::Rect> = None;
@@ -3280,7 +3296,9 @@ fn key_char(key: Key) -> Option<char> {
 
 /// 紧凑面板边框：缩小四周内边距，减少留白。
 fn compact_frame() -> egui::Frame {
-    egui::Frame::new().inner_margin(egui::Margin::symmetric(6, 2))
+    egui::Frame::new()
+        .fill(Color32::from_rgb(247, 248, 250))
+        .inner_margin(egui::Margin::symmetric(6, 2))
 }
 
 fn files_panel(ui: &mut egui::Ui, app: &mut SshApp) {
@@ -3290,14 +3308,14 @@ fn files_panel(ui: &mut egui::Ui, app: &mut SshApp) {
     let handle_h = 5.0;
     let (handle_rect, handle_resp) =
         ui.allocate_exact_size(egui::vec2(ui.available_width(), handle_h), egui::Sense::drag());
-    ui.painter().rect_filled(handle_rect, 0.0, Color32::from_rgb(36, 36, 44));
+    ui.painter().rect_filled(handle_rect, 0.0, Color32::from_rgb(228, 231, 235));
     ui.painter().rect_filled(
         egui::Rect::from_min_max(
             egui::pos2(handle_rect.center().x - 30.0, handle_rect.top() + 1.5),
             egui::pos2(handle_rect.center().x + 30.0, handle_rect.bottom() - 1.5),
         ),
         1.5,
-        Color32::from_rgb(110, 110, 130),
+        Color32::from_rgb(148, 163, 184),
     );
     if handle_resp.dragged() {
         let delta = handle_resp.drag_delta().y;
@@ -3308,7 +3326,7 @@ fn files_panel(ui: &mut egui::Ui, app: &mut SshApp) {
         ui.output_mut(|o| o.cursor_icon = egui::CursorIcon::ResizeVertical);
     }
     ui.horizontal(|ui| {
-        ui.strong(RichText::new("远程文件").color(Color32::WHITE));
+        ui.strong(RichText::new("远程文件").color(Color32::from_rgb(31, 41, 55)));
         ui.separator();
         if ui
             .add_enabled(connected, egui::Button::new("⬆ 上级"))
@@ -3419,7 +3437,7 @@ fn files_panel(ui: &mut egui::Ui, app: &mut SshApp) {
     });
 
     ui.horizontal(|ui| {
-        ui.label(RichText::new("路径").color(Color32::WHITE));
+        ui.label(RichText::new("路径").color(Color32::from_rgb(31, 41, 55)));
         if connected {
             let resp = ui.add(
                 egui::TextEdit::singleline(&mut app.sessions[idx].cwd)
@@ -3483,7 +3501,7 @@ fn files_panel(ui: &mut egui::Ui, app: &mut SshApp) {
             // 左列：本地面板
             ui.vertical(|ui| {
                 ui.set_width((ui.available_width() * 0.40).max(190.0));
-                ui.strong(RichText::new("本地").color(Color32::WHITE));
+                ui.strong(RichText::new("本地").color(Color32::from_rgb(31, 41, 55)));
                 render_local_table(ui, app, list_h);
             });
             // 中列：传输按钮（本地选中 → 上传；远程选中 → 下载）
@@ -3553,7 +3571,7 @@ fn files_panel(ui: &mut egui::Ui, app: &mut SshApp) {
                     .get(idx)
                     .map(|t| format!("{} : {}", t.account.name, t.cwd))
                     .unwrap_or_else(|| "远程".to_string());
-                ui.strong(RichText::new(sess_txt).color(Color32::WHITE));
+                ui.strong(RichText::new(sess_txt).color(Color32::from_rgb(31, 41, 55)));
                 render_remote_table(ui, app, idx, &mut actions, list_h);
             });
         });
@@ -3682,16 +3700,16 @@ fn render_remote_table(
                 .column(Column::remainder())
                 .header(22.0, |mut h| {
                     h.col(|ui| {
-                        ui.strong(RichText::new("名称").color(Color32::WHITE));
+                        ui.strong(RichText::new("名称").color(Color32::from_rgb(55, 65, 81)));
                     });
                     h.col(|ui| {
-                        ui.strong(RichText::new("大小").color(Color32::WHITE));
+                        ui.strong(RichText::new("大小").color(Color32::from_rgb(55, 65, 81)));
                     });
                     h.col(|ui| {
-                        ui.strong(RichText::new("修改时间").color(Color32::WHITE));
+                        ui.strong(RichText::new("修改时间").color(Color32::from_rgb(55, 65, 81)));
                     });
                     h.col(|ui| {
-                        ui.strong(RichText::new("权限").color(Color32::WHITE));
+                        ui.strong(RichText::new("权限").color(Color32::from_rgb(55, 65, 81)));
                     });
                 })
                 .body(|mut body| {
@@ -3703,9 +3721,9 @@ fn render_remote_table(
                                 app.sessions[idx].selected.as_deref() == Some(path.as_str());
                             let (r1, _) = row.col(|ui| {
                                 let color = if is_dir {
-                                    Color32::from_rgb(120, 180, 255)
+                                    Color32::from_rgb(29, 78, 216)
                                 } else if selected {
-                                    Color32::from_rgb(210, 228, 255)
+                                    Color32::from_rgb(30, 64, 175)
                                 } else {
                                     ui.visuals().text_color()
                                 };
@@ -3718,7 +3736,7 @@ fn render_remote_table(
                                     is_dir,
                                     entry.is_symlink,
                                     selected,
-                                    false,
+                                    true,
                                 );
                                 let hr = ui.horizontal(|ui| {
                                     ui.label(RichText::new(&entry.name).color(color));
@@ -3761,9 +3779,9 @@ fn render_remote_table(
                                 let hovered = ui.rect_contains_pointer(row_full);
                                 if hovered || selected {
                                     let bg = if selected {
-                                        Color32::from_rgba_unmultiplied(58, 88, 138, 120)
+                                        Color32::from_rgba_unmultiplied(191, 219, 254, 200)
                                     } else {
-                                        Color32::from_rgba_unmultiplied(82, 122, 182, 55)
+                                        Color32::from_rgba_unmultiplied(219, 234, 254, 120)
                                     };
                                     ui.painter().rect_filled(row_full, 2.0, bg);
                                 }
@@ -3842,13 +3860,13 @@ fn render_local_table(ui: &mut egui::Ui, app: &mut SshApp, avail_h: f32) {
                 .column(Column::remainder())
                 .header(22.0, |mut h| {
                     h.col(|ui| {
-                        ui.strong(RichText::new("名称").color(Color32::WHITE));
+                        ui.strong(RichText::new("名称").color(Color32::from_rgb(55, 65, 81)));
                     });
                     h.col(|ui| {
-                        ui.strong(RichText::new("大小").color(Color32::WHITE));
+                        ui.strong(RichText::new("大小").color(Color32::from_rgb(55, 65, 81)));
                     });
                     h.col(|ui| {
-                        ui.strong(RichText::new("修改时间").color(Color32::WHITE));
+                        ui.strong(RichText::new("修改时间").color(Color32::from_rgb(55, 65, 81)));
                     });
                 })
                 .body(|mut body| {
@@ -3859,13 +3877,13 @@ fn render_local_table(ui: &mut egui::Ui, app: &mut SshApp, avail_h: f32) {
                         body.row(20.0, |mut row| {
                             let (r1, _) = row.col(|ui| {
                                 let color = if is_dir {
-                                    Color32::from_rgb(120, 180, 255)
+                                    Color32::from_rgb(29, 78, 216)
                                 } else {
                                     ui.visuals().text_color()
                                 };
                                 let (icon_rect, _) =
                                     ui.allocate_exact_size(egui::vec2(15.0, 13.0), egui::Sense::hover());
-                                paint_file_icon(ui.painter(), icon_rect, is_dir, false, selected, false);
+                                paint_file_icon(ui.painter(), icon_rect, is_dir, false, selected, true);
                                 let hr = ui.horizontal(|ui| {
                                     ui.label(RichText::new(&e.name).color(color));
                                 });
@@ -3895,9 +3913,9 @@ fn render_local_table(ui: &mut egui::Ui, app: &mut SshApp, avail_h: f32) {
                                 let hovered = ui.rect_contains_pointer(row_full);
                                 if hovered || selected {
                                     let bg = if selected {
-                                        Color32::from_rgba_unmultiplied(58, 88, 138, 120)
+                                        Color32::from_rgba_unmultiplied(191, 219, 254, 200)
                                     } else {
-                                        Color32::from_rgba_unmultiplied(82, 122, 182, 55)
+                                        Color32::from_rgba_unmultiplied(219, 234, 254, 120)
                                     };
                                     ui.painter().rect_filled(row_full, 2.0, bg);
                                 }
