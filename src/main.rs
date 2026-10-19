@@ -3406,6 +3406,8 @@ fn files_panel(ui: &mut egui::Ui, app: &mut SshApp) {
 
     // 主体水平分栏：左侧文件内容 | 右侧传输队列（高度跟随文件区域）
     ui.horizontal(|ui| {
+        // 强制主体撑满文件区剩余高度，分隔线因此始终贯穿全高（不依赖内容高度）
+        ui.set_min_height(ui.available_height());
         // 左列：路径 + 文件内容
         ui.vertical(|ui| {
             ui.set_width(ui.available_width() - 252.0);
@@ -3630,21 +3632,26 @@ fn files_panel(ui: &mut egui::Ui, app: &mut SshApp) {
         }
     });
         // 右列：传输队列（高度跟随文件区域）
-        if app.show_transfer {
-            // 分隔线：队列与文件区域之间（贯穿文件区高度）
-            let sep_x = ui.cursor().min.x + 3.0;
-            let sep_y0 = ui.cursor().min.y - 2.0;
-            let sep_y1 = ui.max_rect().bottom();
-            ui.painter().vline(
-                sep_x,
-                egui::Rangef::new(sep_y0, sep_y1),
-                egui::Stroke::new(1.0_f32, Color32::from_rgb(226, 232, 240)),
-            );
+        let queue_left: Option<f32> = if app.show_transfer {
+            let qx = ui.cursor().min.x;
             ui.add_space(8.0);
             ui.vertical(|ui| {
                 ui.set_width(240.0);
                 transfer_panel_content(ui, app);
             });
+            Some(qx)
+        } else {
+            None
+        };
+        // 分隔线：队列与文件区域之间（最后绘制确保不被覆盖，颜色加深为可见灰蓝）
+        if let Some(qx) = queue_left {
+            let sep_y0 = ui.max_rect().top();
+            let sep_y1 = ui.max_rect().bottom();
+            ui.painter().vline(
+                qx - 4.0,
+                egui::Rangef::new(sep_y0, sep_y1),
+                egui::Stroke::new(1.0_f32, Color32::from_rgb(203, 213, 225)),
+            );
         }
     });
 }
