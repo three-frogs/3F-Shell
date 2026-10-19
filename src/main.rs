@@ -1329,6 +1329,23 @@ impl eframe::App for SshApp {
             )
             .show(ctx, |ui| left_panel(ui, self));
 
+        // 右侧面板：系统信息 + 传输队列（常驻，点击"记录"按钮切换显隐）
+        if self.show_transfer {
+            egui::SidePanel::right("transfer_side")
+                .resizable(true)
+                .default_width(264.0)
+                .frame(
+                    egui::Frame::new()
+                        .fill(Color32::from_rgb(255, 255, 255))
+                        .inner_margin(egui::Margin::symmetric(8, 6)),
+                )
+                .show(ctx, |ui| {
+                    system_info_block(ui, self);
+                    ui.separator();
+                    transfer_panel_content(ui, self);
+                });
+        }
+
         // 文件面板：高度完全由用户手动拖动分隔条控制（无拖动时保持不变）。
         // 默认高度首次按窗口一半固定；之后仅拖动分隔条时更新。
         if self.files_h.is_none() {
@@ -1811,113 +1828,71 @@ fn left_panel(ui: &mut egui::Ui, app: &mut SshApp) {
         save_accounts(&app.accounts);
         app.status_set("账号已删除");
     }
-    ui.add_space(6.0);
+    // 左侧栏仅保留服务器列表（对齐设计稿）；连接状态 / 系统信息 / 断开连接见终端标题栏与右侧面板
+}
 
-    // ---- 状态 ----
-    ui.strong(RichText::new("状态").color(Color32::from_rgb(31, 41, 55)));
-    ui.separator();
-    // 断开连接栏最上面：展示当前连接标签页的名称与 IP（有连接时显示）
-    let (connected, connecting, status_text, name_text) = if let Some(t) =
-        app.sessions.get(app.active_idx())
-    {
-        (
-            t.connected,
-            t.connecting,
-            t.status.clone(),
-            Some((t.account.name.clone(), t.account.host.clone(), t.account.port)),
-        )
-    } else {
-        (false, false, "未连接".to_string(), None)
-    };
-    if connected {
-        if let Some((name, host, port)) = name_text {
-            ui.strong(
-                RichText::new(format!("{name} ({host}:{port})"))
-                    .size(14.0)
-                    .color(Color32::from_rgb(31, 41, 55)),
-            );
-        }
-        ui.add_space(2.0);
-        if ui
-            .button(RichText::new("断开连接").color(Color32::LIGHT_RED))
-            .clicked()
-        {
-            let idx = app.active_idx();
-            app.close_tab(idx);
-        }
-        ui.add_space(2.0);
-    }
-    // 断开连接栏前后的状态信息统一使用深色字体
-    let (color, text) = if connected {
-        (Color32::from_rgb(31, 41, 55), status_text)
-    } else if connecting {
-        (Color32::from_rgb(31, 41, 55), format!("正在连接... {status_text}"))
-    } else {
-        (Color32::from_rgb(156, 163, 175), status_text)
-    };
-    ui.colored_label(color, text);
-    ui.add_space(6.0);
-
-    // ---- 系统信息 ----
+/// 系统信息区（CPU / 内存 / 硬盘柱状图 + 预警阈值），显示在右侧传输队列面板顶部。
+fn system_info_block(ui: &mut egui::Ui, app: &mut SshApp) {
     ui.strong(RichText::new("系统信息").color(Color32::from_rgb(31, 41, 55)));
     ui.separator();
-    if connected {
-        let sysinfo: Vec<(String, String)> = app
-            .sessions
-            .get(app.active_idx())
-            .map(|t| t.sysinfo.clone())
-            .unwrap_or_default();
-        if sysinfo.is_empty() {
-            ui.weak("获取中...");
-        }
-        for (k, v) in &sysinfo {
-            match k.as_str() {
-                // CPU / 内存 / 硬盘：柱状图 + 详细文本 + 超过预警阈值提示
-                "CPU" | "内存" | "硬盘" => {
-                    ui.horizontal(|ui| {
-                        ui.weak(format!("{k}:"));
-                        if let Some(pct) = metric_pct(v) {
-                            // 预警阈值对齐设计稿：使用率达到 40% 即提示
-                            let warn = pct >= 40.0;
-                            ui.add(
-                                egui::ProgressBar::new(pct / 100.0)
-                                    .desired_width(160.0)
-                                    .fill(if warn {
-                                        Color32::from_rgb(220, 60, 60)
-                                    } else {
-                                        usage_color(pct)
-                                    })
-                                    .text(format!("{pct:.0}%")),
+    let (connected, sysinfo) = app
+        .sessions
+        .get(app.active_idx())
+        .map(|t| (t.connected, t.sysinfo.clone()))
+        .unwrap_or((false, Vec::new()));
+    if !connected {
+        ui.weak("未连接");
+        return;
+    }
+    if sysinfo.is_empty() {
+        ui.weak("获取中...");
+        return;
+    }
+    for (k, v) in &sysinfo {
+        match k.as_str() {
+            // CPU / 内存 / 硬盘：柱状图 + 详细文本 + 超过预警阈值提示
+            "CPU" | "内存" | "硬盘" => {
+                ui.horizontal(|ui| {
+                    ui.weak(format!("{k}:"));
+                    if let Some(pct) = metric_pct(v) {
+                        // 预警阈值对齐设计稿：使用率达到 40% 即提示
+                        let warn = pct >= 40.0;
+                        ui.add(
+                            egui::ProgressBar::new(pct / 100.0)
+                                .desired_width(128.0)
+                                .fill(if warn {
+                                    Color32::from_rgb(220, 60, 60)
+                                } else {
+                                    usage_color(pct)
+                                })
+                                .text(format!("{pct:.0}%")),
+                        );
+                        if warn {
+                            ui.colored_label(
+                                Color32::from_rgb(220, 60, 60),
+                                "⚠ 超预警阈值 40%",
                             );
-                            if warn {
-                                ui.colored_label(
-                                    Color32::from_rgb(255, 110, 110),
-                                    "⚠ 超预警阈值 40%",
-                                );
-                            }
                         }
-                    });
-                    ui.weak(v.clone());
-                }
-                _ => {
-                    ui.horizontal(|ui| {
-                        ui.weak(format!("{k}:"));
-                        ui.label(v);
-                    });
-                }
+                    }
+                });
+                ui.weak(v.clone());
+            }
+            _ => {
+                ui.horizontal(|ui| {
+                    ui.weak(format!("{k}:"));
+                    ui.label(v);
+                });
             }
         }
-        if ui.button("刷新系统信息").clicked() {
-            let idx = app.active_idx();
-            let id = app.sessions[idx].id.clone();
-            app.send(FsMsg::For {
-                id,
-                msg: FsInner::SysInfo,
-            });
-            app.status_set("刷新系统信息中...");
-        }
-    } else {
-        ui.weak("未连接");
+    }
+    if ui.button("刷新系统信息").clicked() {
+        let idx = app.active_idx();
+        let id = app.sessions[idx].id.clone();
+        app.send(FsMsg::For {
+            id,
+            msg: FsInner::SysInfo,
+        });
+        app.status_set("刷新系统信息中...");
     }
 }
 
@@ -2154,8 +2129,18 @@ fn term_panel(ui: &mut egui::Ui, app: &mut SshApp) {
         } else {
             ui.colored_label(Color32::from_rgb(107, 114, 128), "未连接");
         }
-        // 右上角：文件面板开关 + 传输记录图标（点击在图标下方展开明细面板）
-        let mut icon_rect: Option<egui::Rect> = None;
+        // 连接时提供断开按钮（设计稿布局调整后从左侧栏移至终端标题栏）
+        if connected {
+            if ui
+                .add(egui::Button::new(RichText::new("断开连接").color(Color32::from_rgb(190, 40, 40))).small())
+                .on_hover_text("关闭当前连接")
+                .clicked()
+            {
+                let idx = app.active_idx();
+                app.close_tab(idx);
+            }
+        }
+        // 右上角：文件面板开关 + 传输队列面板开关（右侧常驻面板）
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             let file_btn = if app.show_files { "📂 文件:开" } else { "📂 文件:关" };
             let fbtn = ui
@@ -2164,35 +2149,14 @@ fn term_panel(ui: &mut egui::Ui, app: &mut SshApp) {
             if fbtn.clicked() {
                 app.show_files = !app.show_files;
             }
-            let icon = if app.show_transfer { "📋" } else { "📋 记录" };
+            let icon = if app.show_transfer { "📋 队列:开" } else { "📋 队列:关" };
             let resp = ui
                 .add(egui::Button::new(icon).small())
-                .on_hover_text("查看上传 / 下载明细记录");
+                .on_hover_text("显示 / 隐藏右侧传输队列面板");
             if resp.clicked() {
                 app.show_transfer = !app.show_transfer;
             }
-            icon_rect = Some(resp.rect);
         });
-        // 明细面板：直接悬挂在图标按钮下侧（浅色"白纸黑字"风格）
-        if app.show_transfer {
-            if let Some(rect) = icon_rect {
-                egui::Area::new(egui::Id::new("transfer_panel"))
-                    .fixed_pos(egui::pos2(rect.left(), rect.bottom() + 4.0))
-                    .order(egui::Order::Foreground)
-                    .show(ui.ctx(), |ui| {
-                        // 面板内临时切换为浅色主题：所有默认文字变黑
-                        ui.visuals_mut().override_text_color = Some(Color32::from_rgb(20, 20, 20));
-                        egui::Frame::popup(ui.style())
-                            .fill(Color32::from_rgb(250, 250, 252))
-                            .stroke(egui::Stroke::new(1.0_f32, Color32::from_rgb(170, 170, 180)))
-                            .corner_radius(6.0)
-                            .inner_margin(egui::Margin::same(8))
-                            .show(ui, |ui| {
-                                transfer_panel_content(ui, app);
-                            });
-                    });
-            }
-        }
     });
     ui.separator();
     if app.sessions.is_empty() {
@@ -2282,25 +2246,17 @@ fn term_panel(ui: &mut egui::Ui, app: &mut SshApp) {
     app.sessions[idx].focus_term = false;
 }
 
-/// 传输明细面板内容：标题行（含 ✕ 关闭）+ 可滚动明细列表。
-/// 面板为浅色"白纸黑字"风格（外层已把 override_text_color 设为黑色）。
+/// 传输队列面板内容（右侧常驻）：标题行（含 ✕ 关闭）+ 实时队列概览 + 可滚动明细列表。
 fn transfer_panel_content(ui: &mut egui::Ui, app: &mut SshApp) {
-    let black = Color32::from_rgb(20, 20, 20);
-    let gray = Color32::from_rgb(90, 90, 100);
-    // 面板内的按钮也切换为浅色"白纸黑字"样式
-    ui.visuals_mut().widgets.inactive.bg_fill = Color32::from_rgb(235, 235, 240);
-    ui.visuals_mut().widgets.inactive.fg_stroke = egui::Stroke::new(1.0_f32, black);
-    ui.visuals_mut().widgets.hovered.bg_fill = Color32::from_rgb(220, 220, 228);
-    ui.visuals_mut().widgets.hovered.fg_stroke = egui::Stroke::new(1.0_f32, black);
-    ui.visuals_mut().widgets.active.bg_fill = Color32::from_rgb(210, 210, 220);
-    ui.visuals_mut().widgets.active.fg_stroke = egui::Stroke::new(1.0_f32, black);
-    ui.set_min_width(440.0);
+    let black = Color32::from_rgb(31, 41, 55);
+    let gray = Color32::from_rgb(107, 114, 128);
+    ui.set_min_width(240.0);
     ui.horizontal(|ui| {
-        ui.strong(RichText::new("上传 / 下载明细").color(black));
+        ui.strong(RichText::new("传输队列").color(black));
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             if ui
                 .add(egui::Button::new("X").small())
-                .on_hover_text("关闭")
+                .on_hover_text("关闭传输队列面板")
                 .clicked()
             {
                 app.show_transfer = false;
