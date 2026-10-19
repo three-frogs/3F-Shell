@@ -3631,7 +3631,16 @@ fn files_panel(ui: &mut egui::Ui, app: &mut SshApp) {
     });
         // 右列：传输队列（高度跟随文件区域）
         if app.show_transfer {
-            ui.separator();
+            // 分隔线：队列与文件区域之间（贯穿文件区高度）
+            let sep_x = ui.cursor().min.x + 3.0;
+            let sep_y0 = ui.cursor().min.y - 2.0;
+            let sep_y1 = ui.max_rect().bottom();
+            ui.painter().vline(
+                sep_x,
+                egui::Rangef::new(sep_y0, sep_y1),
+                egui::Stroke::new(1.0_f32, Color32::from_rgb(226, 232, 240)),
+            );
+            ui.add_space(8.0);
             ui.vertical(|ui| {
                 ui.set_width(240.0);
                 transfer_panel_content(ui, app);
