@@ -3405,10 +3405,12 @@ fn files_panel(ui: &mut egui::Ui, app: &mut SshApp) {
     });
     ui.separator();
 
-    // 主体水平分栏：左侧文件内容 | 右侧传输队列（高度跟随文件区域）
+    // 主体水平分栏：左侧文件内容 | 右侧传输队列（高度跟随文件区域）。
+    // 先固定记录文件区剩余高度，表格 / 双栏面板都使用该确定高度（避免嵌套布局取到收缩值）
+    let body_h = ui.available_height();
     ui.horizontal(|ui| {
         // 强制主体撑满文件区剩余高度，分隔线因此始终贯穿全高（不依赖内容高度）
-        ui.set_min_height(ui.available_height());
+        ui.set_min_height(body_h);
         // 左列：路径 + 文件内容
         ui.vertical(|ui| {
             ui.set_width(ui.available_width() - 252.0);
@@ -3452,7 +3454,7 @@ fn files_panel(ui: &mut egui::Ui, app: &mut SshApp) {
     }
     if app.show_dual {
         // ===== 双栏传输模式：本地面板 | 传输按钮 | 远程列表（对齐设计稿：本地在左、远程在右） =====
-        let list_h = (ui.available_height() - 36.0).max(60.0);
+        let list_h = (body_h - 36.0).max(60.0);
         ui.horizontal(|ui| {
             // 左列：本地面板
             ui.vertical(|ui| {
@@ -3541,7 +3543,7 @@ fn files_panel(ui: &mut egui::Ui, app: &mut SshApp) {
             app,
             idx,
             &mut actions,
-            (ui.available_height() - hint_h).max(40.0),
+            (body_h - hint_h).max(40.0),
         );
         ui.add_space(2.0);
         ui.weak("双击用默认编辑器打开 · 支持拖拽文件到此处直接上传");
