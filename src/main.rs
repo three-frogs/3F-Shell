@@ -2278,6 +2278,9 @@ fn transfer_panel_content(ui: &mut egui::Ui, app: &mut SshApp) {
     ui.set_min_width(240.0);
     ui.horizontal(|ui| {
         ui.strong(RichText::new("传输队列").color(black));
+        // 任务计数（对齐设计稿「2个任务」）
+        let n = app.transfer_log.len();
+        ui.label(RichText::new(format!("{n} 个任务")).color(gray).size(11.5));
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             if ui
                 .add(egui::Button::new("X").small())
@@ -2299,17 +2302,8 @@ fn transfer_panel_content(ui: &mut egui::Ui, app: &mut SshApp) {
             let up = app.active_transfer == Some(true);
             let pct = (done.min(total) as f32 / total as f32).clamp(0.0, 1.0);
             let dir_icon = if up { "⬆" } else { "⬇" };
-            // 动态统计进行中的任务数（对齐设计稿：传输队列 N 个任务）
-            let active_cnt = app
-                .transfer_log
-                .iter()
-                .filter(|r| !r.ok && r.detail == "进行中...")
-                .count()
-                .max(1);
             ui.horizontal(|ui| {
-                ui.strong(
-                    RichText::new(format!("{dir_icon} 传输队列  {active_cnt} 个任务")).color(black),
-                );
+                ui.strong(RichText::new(dir_icon).color(black));
                 if app.cur_rate > 0.0 {
                     ui.label(
                         RichText::new(format!("{} / s", fmt_size(app.cur_rate as u64)))
@@ -3314,7 +3308,57 @@ fn files_panel(ui: &mut egui::Ui, app: &mut SshApp) {
     }
     ui.horizontal(|ui| {
         ui.strong(RichText::new("远程文件").color(Color32::from_rgb(31, 41, 55)));
-        ui.separator();
+        let cwd_show = app
+            .sessions
+            .get(idx)
+            .map(|t| t.cwd.clone())
+            .unwrap_or_default();
+        ui.label(
+            RichText::new(format!("  {}", truncate_wide(&cwd_show, 30)))
+                .color(Color32::from_rgb(107, 114, 128)),
+        );
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            // 传输队列开关：带任务计数（对齐设计稿「传输队列 N 个任务」）
+            let n = app.transfer_log.len();
+            if ui
+                .add(egui::Button::new(format!("📋 传输队列 {n} 个任务")).small())
+                .on_hover_text("显示 / 隐藏右侧传输队列（高度跟随文件区域）")
+                .clicked()
+            {
+                app.show_transfer = !app.show_transfer;
+            }
+            // 上传主按钮（设计稿主视觉：蓝底白字「上传」）
+            if ui
+                .add_enabled(
+                    connected,
+                    egui::Button::new(RichText::new("上传").color(Color32::WHITE))
+                        .fill(Color32::from_rgb(59, 130, 246)),
+                )
+                .clicked()
+            {
+                if let Some(path) = rfd::FileDialog::new().pick_file() {
+                    let dir = app.sessions[idx].cwd.clone();
+                    let id = app.sessions[idx].id.clone();
+                    let name = path
+                        .file_name()
+                        .map(|n| n.to_string_lossy().into_owned())
+                        .unwrap_or_else(|| "文件".to_string());
+                    app.start_transfer(true, name, false);
+                    app.status_set("上传中...");
+                    app.send(FsMsg::For {
+                        id,
+                        msg: FsInner::Upload {
+                            local: path,
+                            remote_dir: dir,
+                        },
+                    });
+                }
+            }
+        });
+    });
+
+    // 工具行：文件操作按钮 + 路径输入框（上传 / 队列开关已移至标题行）
+    ui.horizontal(|ui| {
         if ui
             .add_enabled(connected, egui::Button::new("⬆ 上级"))
             .clicked()
@@ -3336,25 +3380,6 @@ fn files_panel(ui: &mut egui::Ui, app: &mut SshApp) {
         {
             app.dialog = Some(DialogKind::Mkdir);
             app.dialog_input.clear();
-        }
-        if ui.add_enabled(connected, egui::Button::new("⬆ 上传")).clicked() {
-            if let Some(path) = rfd::FileDialog::new().pick_file() {
-                let dir = app.sessions[idx].cwd.clone();
-                let id = app.sessions[idx].id.clone();
-                let name = path
-                    .file_name()
-                    .map(|n| n.to_string_lossy().into_owned())
-                    .unwrap_or_else(|| "文件".to_string());
-                app.start_transfer(true, name, false);
-                app.status_set("上传中...");
-                app.send(FsMsg::For {
-                    id,
-                    msg: FsInner::Upload {
-                        local: path,
-                        remote_dir: dir,
-                    },
-                });
-            }
         }
         let has_sel = app.sessions.get(idx).map(|t| t.selected.is_some()).unwrap_or(false);
         if ui
@@ -3414,15 +3439,6 @@ fn files_panel(ui: &mut egui::Ui, app: &mut SshApp) {
                 app.local_entries = load_local_entries(&app.local_dir);
             }
         }
-        ui.separator();
-        let qbtn = if app.show_transfer { "📋 队列:开" } else { "📋 队列:关" };
-        if ui
-            .add(egui::Button::new(qbtn).small())
-            .on_hover_text("显示 / 隐藏右侧传输队列（高度跟随文件区域）")
-            .clicked()
-        {
-            app.show_transfer = !app.show_transfer;
-        }
         if ui
             .add(egui::Button::new("✕ 关闭").small())
             .on_hover_text("关闭文件操作区域（关闭后底部保留标签条）")
@@ -3430,14 +3446,12 @@ fn files_panel(ui: &mut egui::Ui, app: &mut SshApp) {
         {
             app.show_files = false;
         }
-    });
-
-    ui.horizontal(|ui| {
-        ui.label(RichText::new("路径").color(Color32::from_rgb(31, 41, 55)));
+        ui.separator();
+        ui.label("路径");
         if connected {
             let resp = ui.add(
                 egui::TextEdit::singleline(&mut app.sessions[idx].cwd)
-                    .desired_width(ui.available_width()),
+                    .desired_width(ui.available_width() - 4.0),
             );
             if resp.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter)) {
                 app.sessions[idx].user_navigated = true; // 手动输入路径，停止自动联动
