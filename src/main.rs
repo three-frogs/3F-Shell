@@ -1312,12 +1312,6 @@ impl eframe::App for SshApp {
         // 空闲时也保持重绘，保证计时器推进
         ctx.request_repaint_after(std::time::Duration::from_secs(1));
 
-        // 顶部标签栏：多连接切换 / 关闭（高度固定，连接后不撑高）
-        egui::TopBottomPanel::top("tab_bar")
-            .exact_height(30.0)
-            .frame(compact_frame())
-            .show(ctx, |ui| tab_bar(ui, self));
-
         // 左侧栏：已存账号 + 状态 + 远端系统信息（连接/断开全部在左侧操作）
         egui::SidePanel::left("left_panel")
             .resizable(true)
@@ -1376,14 +1370,19 @@ impl eframe::App for SshApp {
             .frame(compact_frame())
             .show(ctx, |ui| status_bar(ui, self));
 
-        // 终端区域吃掉全部剩余空间，避免底部留白
+        // 终端区域吃掉全部剩余空间，避免底部留白。
+        // 右侧主操作区：标签栏位于命令行区域顶部，下方为终端内容
         egui::CentralPanel::default()
             .frame(
                 egui::Frame::new()
                     .fill(Color32::from_rgb(255, 255, 255))
                     .inner_margin(egui::Margin::symmetric(6, 2)),
             )
-            .show(ctx, |ui| term_panel(ui, self));
+            .show(ctx, |ui| {
+                tab_bar(ui, self);
+                ui.separator();
+                term_panel(ui, self);
+            });
 
         // 模态对话框
         if let Some(kind) = self.dialog {
