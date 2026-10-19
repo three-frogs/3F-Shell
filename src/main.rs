@@ -613,10 +613,11 @@ impl SshApp {
             }
         }
 
-        // 把 cjk / icon_font 挂到两个字族末尾（默认字形优先命中，中文与图标回退到自定义字体）
+        // 把 cjk / icon_font 挂到两个字族末尾（默认字形优先命中，中文与图标回退到自定义字体）。
+        // 注意：保留 egui 内置 emoji-icon-font（含 ✓ ✖ ⬆ ⬇ ✏ 等标准图标），
+        // 仅移除会导致按钮/状态图标渲染为空。
         for family in [egui::FontFamily::Proportional, egui::FontFamily::Monospace] {
             if let Some(list) = fonts.families.get_mut(&family) {
-                list.retain(|n| n != "emoji-icon-font");
                 if cjk_loaded {
                     list.push("cjk".to_owned());
                 }
@@ -900,7 +901,7 @@ impl SshApp {
                     if let Some(tab) = self.sessions.iter_mut().find(|t| t.token == token) {
                         tab.connecting = false;
                         tab.status = format!("连接失败：{e}");
-                        tab.login_log.push(format!("✗ 连接失败：{e}"));
+                        tab.login_log.push(format!("× 连接失败：{e}"));
                     }
                 }
                 BackMsg::Log(s) => {
@@ -957,7 +958,7 @@ impl SshApp {
             tab.connected = false;
             tab.shell_alive = false;
             tab.term = None;
-            tab.login_log.push(format!("✗ 连接已失效：{e}"));
+            tab.login_log.push(format!("× 连接已失效：{e}"));
             tab.login_log.push("已停止自动重连，请手动连接".into());
             tab.status = format!("连接已失效：{e}（已停止自动重连）");
             return;
@@ -968,7 +969,7 @@ impl SshApp {
             tab.connected = false;
             tab.shell_alive = false;
             tab.term = None;
-            tab.login_log.push(format!("✗ 连接已失效：{e}"));
+            tab.login_log.push(format!("× 连接已失效：{e}"));
             tab.login_log.push(format!(
                 "正在自动重连（第 {} 次）...",
                 tab.reconnect_attempts
@@ -2301,7 +2302,7 @@ fn transfer_panel_content(ui: &mut egui::Ui, app: &mut SshApp) {
         if total > 0 && app.active_transfer.is_some() {
             let up = app.active_transfer == Some(true);
             let pct = (done.min(total) as f32 / total as f32).clamp(0.0, 1.0);
-            let dir_icon = if up { "⬆" } else { "⬇" };
+            let dir_icon = if up { "↑" } else { "↓" };
             ui.horizontal(|ui| {
                 ui.strong(RichText::new(dir_icon).color(black));
                 if app.cur_rate > 0.0 {
@@ -2694,7 +2695,7 @@ fn render_terminal(
     } else {
         // 焦点提示 / 回看历史提示（画在终端底部）
         let hint = if term.scroll_offset > 0 {
-            "⬆ 回看历史中，输入任意键回到最新"
+            "↑ 回看历史中，输入任意键回到最新"
         } else {
             "点击此处获得键盘输入"
         };
@@ -3387,7 +3388,7 @@ fn files_panel(ui: &mut egui::Ui, app: &mut SshApp) {
     // 工具行：文件操作按钮 + 路径输入框（上传 / 队列开关已移至标题行）
     ui.horizontal(|ui| {
         if ui
-            .add_enabled(connected, egui::Button::new("⬆ 上级"))
+            .add_enabled(connected, egui::Button::new("↑ 上级"))
             .clicked()
         {
             if let Some(p) = parent_of(&app.sessions[idx].cwd) {
@@ -3396,13 +3397,13 @@ fn files_panel(ui: &mut egui::Ui, app: &mut SshApp) {
             }
         }
         if ui
-            .add_enabled(connected, egui::Button::new("↻ 刷新"))
+            .add_enabled(connected, egui::Button::new("🔄 刷新"))
             .clicked()
         {
             app.reload();
         }
         if ui
-            .add_enabled(connected, egui::Button::new("＋ 新建目录"))
+            .add_enabled(connected, egui::Button::new("+ 新建目录"))
             .clicked()
         {
             app.dialog = Some(DialogKind::Mkdir);
@@ -3410,7 +3411,7 @@ fn files_panel(ui: &mut egui::Ui, app: &mut SshApp) {
         }
         let has_sel = app.sessions.get(idx).map(|t| t.selected.is_some()).unwrap_or(false);
         if ui
-            .add_enabled(connected && has_sel, egui::Button::new("⬇ 下载"))
+            .add_enabled(connected && has_sel, egui::Button::new("↓ 下载"))
             .clicked()
         {
             if let Some(remote) = app.sessions[idx].selected.clone() {
@@ -3432,7 +3433,7 @@ fn files_panel(ui: &mut egui::Ui, app: &mut SshApp) {
             }
         }
         if ui
-            .add_enabled(connected && has_sel, egui::Button::new("✎ 重命名"))
+            .add_enabled(connected && has_sel, egui::Button::new("✏ 重命名"))
             .clicked()
         {
             if let Some(sel) = app.sessions[idx].selected.clone() {
@@ -3455,10 +3456,10 @@ fn files_panel(ui: &mut egui::Ui, app: &mut SshApp) {
             }
         }
         ui.separator();
-        let dual_btn = if app.show_dual { "⇄ 单栏" } else { "⇄ 双栏" };
+        let dual_btn = if app.show_dual { "‖ 单栏" } else { "‖ 双栏" };
         if ui
             .add(egui::Button::new(dual_btn).small())
-            .on_hover_text("双栏传输：本地 ⇄ 远程对照面板")
+            .on_hover_text("双栏传输：本地 ‖ 远程对照面板")
             .clicked()
         {
             app.show_dual = !app.show_dual;
@@ -3467,7 +3468,7 @@ fn files_panel(ui: &mut egui::Ui, app: &mut SshApp) {
             }
         }
         if ui
-            .add(egui::Button::new("✕ 关闭").small())
+            .add(egui::Button::new("× 关闭").small())
             .on_hover_text("关闭文件操作区域（关闭后底部保留标签条）")
             .clicked()
         {
@@ -3892,7 +3893,7 @@ fn render_remote_table(
                             let menu_path = path.clone();
                             let menu_is_dir = is_dir;
                             row.response().context_menu(|ui| {
-                                if ui.button("⬇ 下载").clicked() {
+                                if ui.button("↓ 下载").clicked() {
                                     actions.push(FilesAction::DownloadSel(menu_path.clone()));
                                     ui.close_menu();
                                 }
@@ -3919,7 +3920,7 @@ fn render_remote_table(
 fn render_local_table(ui: &mut egui::Ui, app: &mut SshApp, avail_h: f32) {
     ui.horizontal(|ui| {
         if ui
-            .add(egui::Button::new("⬆").small())
+            .add(egui::Button::new("↑").small())
             .on_hover_text("上级目录")
             .clicked()
         {
@@ -3931,7 +3932,7 @@ fn render_local_table(ui: &mut egui::Ui, app: &mut SshApp, avail_h: f32) {
             }
         }
         if ui
-            .add(egui::Button::new("↻").small())
+            .add(egui::Button::new("🔄").small())
             .on_hover_text("刷新")
             .clicked()
         {
