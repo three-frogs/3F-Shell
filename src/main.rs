@@ -816,8 +816,17 @@ impl SshApp {
 
     /// 当前连接表单对应的账号（内存态，密码始终保留，供自动重连使用）。
     fn current_account(&self) -> SavedAccount {
-        let host = self.host.trim().to_string();
-        let user = self.user.trim().to_string();
+        let host_raw = self.host.trim().to_string();
+        // 支持设计稿单行输入「root@10.0.1.24」：自动拆分用户名与主机地址
+        let (user, host) = match host_raw.find('@') {
+            Some(i) => {
+                let u = host_raw[..i].trim().to_string();
+                let h = host_raw[i + 1..].trim().to_string();
+                (u, h)
+            }
+            None => (self.user.trim().to_string(), host_raw),
+        };
+        let user = if user.is_empty() { "root".to_string() } else { user };
         SavedAccount {
             name: format!("{user}@{host}"),
             host,
@@ -1848,23 +1857,21 @@ fn system_info_block(ui: &mut egui::Ui, app: &mut SshApp) {
                 ui.horizontal(|ui| {
                     ui.weak(format!("{k}:"));
                     if let Some(pct) = metric_pct(v) {
-                        // 预警阈值对齐设计稿：使用率达到 40% 即提示
+                        // 预警阈值对齐设计稿：使用率达到 40% 即提示（设计稿 002：黄色预警）
                         let warn = pct >= 40.0;
+                        let warn_color = Color32::from_rgb(217, 119, 6);
                         ui.add(
                             egui::ProgressBar::new(pct / 100.0)
                                 .desired_width(128.0)
                                 .fill(if warn {
-                                    Color32::from_rgb(220, 60, 60)
+                                    warn_color
                                 } else {
                                     usage_color(pct)
                                 })
                                 .text(format!("{pct:.0}%")),
                         );
                         if warn {
-                            ui.colored_label(
-                                Color32::from_rgb(220, 60, 60),
-                                "⚠ 超预警阈值 40%",
-                            );
+                            ui.colored_label(warn_color, "⚠ 已超过预警阈值 40%");
                         }
                     }
                 });
@@ -2006,30 +2013,33 @@ fn quick_connect_panel(ui: &mut egui::Ui, app: &mut SshApp) {
     cui.strong(RichText::new("快速连接").size(14.0).color(Color32::from_rgb(31, 41, 55)));
     cui.add_space(4.0);
 
-    egui::Grid::new("quick_grid")
-        .num_columns(2)
-        .spacing(egui::vec2(10.0, 6.0))
-        .show(&mut cui, |ui| {
-            ui.label("用户名");
-            ui.add(egui::TextEdit::singleline(&mut app.user).desired_width(240.0).hint_text("root"));
-            ui.end_row();
-            ui.label("主机地址");
-            ui.add(egui::TextEdit::singleline(&mut app.host).desired_width(240.0).hint_text("root@10.0.1.24 或 10.0.1.24"));
-            ui.end_row();
-            ui.label("端口");
-            ui.add(egui::TextEdit::singleline(&mut app.port).desired_width(90.0));
-            ui.end_row();
-            ui.label("密码");
-            ui.add(
-                egui::TextEdit::singleline(&mut app.password)
-                    .password(true)
-                    .desired_width(240.0)
-                    .hint_text("留空则使用密钥或免密登录"),
-            );
-            ui.end_row();
-        });
-    cui.add_space(4.0);
+    // 设计稿 002：单行「用户名@主机地址」+ 端口 + 连接按钮
     cui.horizontal(|ui| {
+        ui.add(
+            egui::TextEdit::singleline(&mut app.host)
+                .desired_width(240.0)
+                .hint_text("用户名@主机地址，如 root@10.0.1.24"),
+        );
+        ui.add(
+            egui::TextEdit::singleline(&mut app.port)
+                .desired_width(56.0)
+                .hint_text("端口"),
+        );
+        if ui.button(RichText::new("连接").strong()).clicked() {
+            let acc = app.current_account();
+            app.connect_account(&acc);
+        }
+    });
+    cui.add_space(4.0);
+    // 密码（可选）与密钥导入；对齐设计稿「支持SSH密钥/密码登录，密钥可从本机一键导入」
+    cui.horizontal(|ui| {
+        ui.label("密码");
+        ui.add(
+            egui::TextEdit::singleline(&mut app.password)
+                .password(true)
+                .desired_width(150.0)
+                .hint_text("可选，留空用密钥/免密"),
+        );
         if ui.button("导入密钥...").clicked() {
             if let Some(p) = rfd::FileDialog::new()
                 .add_filter("私钥", &["pem", "key"])
@@ -2044,10 +2054,6 @@ fn quick_connect_panel(ui: &mut egui::Ui, app: &mut SshApp) {
                 .map(|n| n.to_string_lossy().into_owned())
                 .unwrap_or_default();
             ui.weak(format!("密钥: {kn}"));
-        }
-        if ui.button(RichText::new("连 接").strong()).clicked() {
-            let acc = app.current_account();
-            app.connect_account(&acc);
         }
     });
     cui.add_space(4.0);
@@ -2066,20 +2072,52 @@ fn quick_connect_panel(ui: &mut egui::Ui, app: &mut SshApp) {
             .show(&mut cui, |ui| {
                 let recent = app.recent.clone();
                 for r in &recent {
-                    let label = if r.cmd.is_empty() {
-                        format!("{}  ·  {}  ({})", r.name, r.host, r.when)
+                    let when = recent_display(&r.when);
+                    let title = if r.host.is_empty() {
+                        format!("{} · {}", r.name, r.user)
                     } else {
-                        format!("{}  ·  {}  |  {}", r.name, r.cmd, r.when)
+                        format!("{} · {}", r.name, r.host)
                     };
-                    if ui
-                        .add_sized(
-                            [260.0, 18.0],
-                            egui::Button::new(
-                                RichText::new(truncate_wide(&label, 40)).size(12.5),
-                            ),
-                        )
-                        .clicked()
-                    {
+                    let sub = if r.cmd.is_empty() {
+                        format!("{}@{}:{}", r.user, r.host, r.port)
+                    } else {
+                        r.cmd.clone()
+                    };
+                    let mut clicked = false;
+                    ui.horizontal(|ui| {
+                        ui.vertical(|ui| {
+                            if ui
+                                .add_sized(
+                                    [250.0, 16.0],
+                                    egui::Button::new(
+                                        RichText::new(truncate_wide(&title, 26)).size(12.5),
+                                    )
+                                    .frame(false),
+                                )
+                                .clicked()
+                            {
+                                clicked = true;
+                            }
+                            ui.add_sized(
+                                [250.0, 15.0],
+                                egui::Button::new(
+                                    RichText::new(truncate_wide(&sub, 32)).size(11.5).weak(),
+                                )
+                                .frame(false),
+                            );
+                        });
+                        ui.with_layout(
+                            egui::Layout::right_to_left(egui::Align::TOP),
+                            |ui| {
+                                ui.label(
+                                    RichText::new(when)
+                                        .color(Color32::from_rgb(120, 130, 145))
+                                        .size(11.5),
+                                );
+                            },
+                        );
+                    });
+                    if clicked {
                         to_reconnect = Some(SavedAccount {
                             name: r.name.clone(),
                             host: r.host.clone(),
@@ -2090,6 +2128,7 @@ fn quick_connect_panel(ui: &mut egui::Ui, app: &mut SshApp) {
                             group: String::new(),
                         });
                     }
+                    ui.separator();
                 }
             });
         if let Some(acc) = to_reconnect {
@@ -2380,7 +2419,12 @@ fn transfer_panel_content(ui: &mut egui::Ui, app: &mut SshApp) {
             }
         });
     ui.add_space(2.0);
-    ui.label(RichText::new(format!("共 {} 条", app.transfer_log.len())).color(gray));
+    ui.horizontal(|ui| {
+        ui.label(RichText::new(format!("共 {} 条", app.transfer_log.len())).color(gray));
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            ui.weak("完成后自动停留 10 秒");
+        });
+    });
 }
 
 /// 渲染终端；返回 (联动目标路径, 待转发的键盘字节, Ctrl+C 中断标志)。Tab 键由外层做本地补全。
@@ -4514,14 +4558,34 @@ fn save_recent(recent: &[RecentSession]) {
 /// 以 host+port+user 为主键更新最近会话（最新在前，最多保留 12 条）。
 fn upsert_recent(recent: &mut Vec<RecentSession>, mut r: RecentSession) {
     recent.retain(|x| !(x.host == r.host && x.port == r.port && x.user == r.user));
-    let mut now = now_hms();
-    if now.len() >= 5 {
-        now = format!("今天 {now}");
-    }
-    r.when = now;
+    r.when = now_compact();
     recent.insert(0, r);
     recent.truncate(12);
     save_recent(recent);
+}
+
+/// 紧凑时间戳（设计稿 002：MM-DD HH:MM）。
+fn now_compact() -> String {
+    chrono::Local::now().format("%m-%d %H:%M").to_string()
+}
+
+/// 最近会话时间显示：今天 / 昨天 + HH:MM，更早显示 MM-DD HH:MM。
+fn recent_display(when: &str) -> String {
+    if when.len() < 11 {
+        return when.to_string();
+    }
+    let (date, time) = when.split_at(5); // "MM-DD" + " HH:MM"
+    let today = chrono::Local::now().format("%m-%d").to_string();
+    let yesterday = (chrono::Local::now() - chrono::Duration::days(1))
+        .format("%m-%d")
+        .to_string();
+    if date == today {
+        format!("今天{time}")
+    } else if date == yesterday {
+        format!("昨天{time}")
+    } else {
+        when.to_string()
+    }
 }
 
 /// 以 host+port+user 为主键去重插入/覆盖。
