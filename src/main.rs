@@ -2127,9 +2127,10 @@ fn system_info_block(ui: &mut egui::Ui, app: &mut SshApp) {
                 ui.weak(v.clone());
             }
             _ => {
+                // 长文本（主机名/系统版本/内核等）必须换行：horizontal 内默认 Extend 会撑宽
                 ui.horizontal(|ui| {
                     ui.weak(format!("{k}:"));
-                    ui.label(v);
+                    ui.add(egui::Label::new(v).wrap()); // 占满剩余宽度并换行，不撑宽左侧栏
                 });
             }
         }
